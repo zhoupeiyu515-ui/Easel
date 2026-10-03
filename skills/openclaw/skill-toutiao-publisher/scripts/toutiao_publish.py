@@ -85,6 +85,19 @@ SUBMIT_SELECTORS = [
 # 正文输入后必须出现的确认态（发布成功页特征），用于判定是否真的发出去了。
 SUCCESS_HINTS = ("发布成功", "已发布", "内容管理", "草稿箱")
 
+# 登录页二维码元素：头条登录走字节 SSO，二维码可能在 <img> / <canvas> / 内嵌组件里，
+# 且后台改版频繁——多选择器逐个试，全不中退回整页截图（宁可给大图，也别给空图）。
+QR_SELECTORS = [
+    "img[src*='qrcode']",
+    "img[src*='qr_code']",
+    "[class*='qrcode'] img",
+    "[class*='qr-code'] img",
+    "canvas[class*='qr']",
+    "img[src^='data:image']",
+]
+# URL 命中这些片段 = 还在登录/SSO 流程里（未登录）。
+_LOGIN_URL_HINTS = ("login", "signin", "passport", "sso", "auth/page")
+
 
 def die(msg: str, code: int = 1):
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -219,6 +232,175 @@ def login(wait_seconds: int, headed: bool = True) -> int:
     die("登录超时：未检测到登录态，请重跑 --login")
 
 
+# ---- Web 工作台驱动用的两个子命令（login / whoami） ----
+# 与 xhs_publish.py / douyin_publish.py 同款约定：Web 后端不直接管浏览器，
+# 只读 login_state 协议文件（轮询进度）和 stdout 的单行 JSON（校验结果）。
+
+def _login_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="toutiao_publish.py login",
+                                description="扫码登录头条号（Web 端驱动，headless 抠二维码）")
+    p.add_argument("--qr-out", help="二维码截图落盘路径（默认 outputs/_login/toutiao.png）")
+    p.add_argument("--status-file", help="登录状态 JSON（默认 outputs/_login/toutiao.json）")
+    p.add_argument("--timeout", type=int, default=180, help="等待扫码秒数")
+    p.add_argument("--headed", action="store_true", help="有头浏览器（本机调试）")
+    return p
+
+
+def _whoami_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="toutiao_publish.py whoami",
+                                description="校验头条号登录态，stdout 输出一行 JSON")
+    p.add_argument("--headed", action="store_true", help="有头浏览器（本机调试）")
+    return p
+
+
+def _is_logged_in(page) -> bool:
+    """URL 已离开登录/SSO 域即视为已登录。
+
+    优先用 URL 而不是元素选择器：未登录时头条号后台会重定向到登录页，
+    这个信号比容易随改版失效的 DOM 特征稳定得多。
+    """
+    url = (page.url or "").lower()
+    return not any(h in url for h in _LOGIN_URL_HINTS)
+
+
+def _capture_qr(page, qr_out: Path) -> bool:
+    """把登录二维码截到 qr_out。多选择器逐个试（最多 15s），全不中退回整页截图。"""
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        for sel in QR_SELECTORS:
+            try:
+                el = page.locator(sel).first
+                if el.count() and el.is_visible():
+                    el.screenshot(path=str(qr_out))
+                    if qr_out.is_file() and qr_out.stat().st_size > 500:
+                        return True
+            except Exception:
+                continue
+        page.wait_for_timeout(500)
+    try:
+        page.screenshot(path=str(qr_out))
+        return qr_out.is_file()
+    except Exception:
+        return False
+
+
+def _qr_login(profile: Path, qr_out: Path, status_file: Path, timeout_s: int,
+              headed: bool = False) -> int:
+    """headless 抠二维码登录：二维码落盘 + 按 login_state 协议写状态，供 Web 轮询。"""
+    import login_state
+
+    try:
+        sync_playwright = _require_playwright()
+    except SystemExit:
+        login_state.write_status(str(status_file), "error", "未安装 playwright")
+        raise
+
+    profile.mkdir(parents=True, exist_ok=True)
+    qr_out.parent.mkdir(parents=True, exist_ok=True)
+    login_state.write_status(str(status_file), "starting", "启动浏览器…")
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            str(profile), headless=not headed, locale="zh-CN", args=LAUNCH_ARGS,
+            viewport={"width": 1440, "height": 900},
+        )
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+            if _is_logged_in(page):
+                login_state.write_status(str(status_file), "success", "已登录")
+                print("✅ 今日头条 已登录（登录态在持久化目录）")
+                return 0
+            if not _capture_qr(page, qr_out):
+                login_state.write_status(str(status_file), "error",
+                                         "未找到登录二维码（头条号后台可能已改版）")
+                return 1
+            login_state.write_status(str(status_file), "qr_ready", "二维码已就绪，请扫码",
+                                     qr=str(qr_out))
+            print(f"📱 二维码已保存：{qr_out}")
+            deadline = time.time() + max(timeout_s, 30)
+            while time.time() < deadline:
+                page.wait_for_timeout(2000)
+                if _is_logged_in(page):
+                    login_state.write_status(str(status_file), "success", "登录成功")
+                    try:
+                        qr_out.unlink()  # 成功后清掉二维码图，避免误扫过期码
+                    except OSError:
+                        pass
+                    print("✅ 登录成功")
+                    return 0
+            login_state.write_status(str(status_file), "expired", "二维码超时未扫")
+            return 1
+        except Exception as exc:
+            login_state.write_status(str(status_file), "error", f"登录失败：{exc}")
+            return 1
+        finally:
+            ctx.close()
+
+
+def _probe_identity(headed: bool = False) -> dict:
+    """打开头条号后台判定登录态。返回 {loggedIn, name, avatar}；失败附 error 字段。
+
+    error 字段是给 Web 端判定的：有它 = 校验本身没跑成（不是可信的「未登录」），
+    web/app.py 据此不写缓存、不把卡片翻成未登录。
+    """
+    out: dict = {"loggedIn": False, "name": "", "avatar": ""}
+    try:
+        sync_playwright = _require_playwright()
+    except SystemExit:
+        out["error"] = "未安装 playwright"
+        return out
+    try:
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        with sync_playwright() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=not headed, locale="zh-CN", args=LAUNCH_ARGS,
+                viewport={"width": 1440, "height": 900},
+            )
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            try:
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(2500)
+                out["loggedIn"] = _is_logged_in(page)
+                if out["loggedIn"]:
+                    out["name"] = _read_display_name(page)
+            finally:
+                ctx.close()
+    except Exception as exc:
+        out["error"] = f"校验失败：{exc}"
+    return out
+
+
+def _read_display_name(page) -> str:
+    """尽力读头条号昵称；读不到返回空串（不阻断 whoami）。"""
+    for sel in ("[class*='user-name']", "[class*='userName']", "[class*='nickname']",
+                "[class*='user-info'] span", "[class*='avatar'] + *"):
+        try:
+            el = page.locator(sel).first
+            if el.count() and el.is_visible():
+                text = (el.inner_text() or "").strip()
+                if text:
+                    return text[:40]
+        except Exception:
+            continue
+    return ""
+
+
+def cmd_login(argv: list[str]) -> int:
+    args = _login_parser().parse_args(argv)
+    root = PROJECT_ROOT / "outputs" / "_login"
+    qr_out = _resolve(args.qr_out) if args.qr_out else (root / "toutiao.png")
+    status_file = (Path(args.status_file).expanduser() if args.status_file
+                   else (root / "toutiao.json"))
+    return _qr_login(PROFILE_DIR, qr_out, status_file, args.timeout, headed=args.headed)
+
+
+def cmd_whoami(argv: list[str]) -> int:
+    args = _whoami_parser().parse_args(argv)
+    print(json.dumps(_probe_identity(headed=args.headed), ensure_ascii=False))
+    return 0
+
+
 def publish_article(content: str, title: str, tags: list[str], cover: Path | None,
                     dry_run: bool, headed: bool, as_draft: bool, timeout_ms: int) -> dict:
     """把图文发到头条号。dry_run=True 时只走到编辑器填写完成，不点发布。"""
@@ -315,8 +497,17 @@ def _selftest() -> int:
     return 0
 
 
-def main() -> int:
-    if "--selftest" in sys.argv[1:]:
+def main(argv: list[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+
+    # Web 工作台驱动用的子命令。这里手动分发而不是用 argparse 的 subparsers，
+    # 是为了让原有 flag 用法（SKILL.md / DEVELOPMENT.md / 单测都在用）一字不变。
+    if args_list and args_list[0] == "login":
+        return cmd_login(args_list[1:])
+    if args_list and args_list[0] == "whoami":
+        return cmd_whoami(args_list[1:])
+
+    if "--selftest" in args_list:
         return _selftest()
 
     parser = argparse.ArgumentParser(description="今日头条（头条号）图文发布工具")
@@ -324,6 +515,7 @@ def main() -> int:
     parser.add_argument("--login", action="store_true", help="打开登录页等扫码，持久化登录态")
     parser.add_argument("--login-wait", type=int, default=180, help="扫码等待秒数（默认 180）")
     parser.add_argument("--input", help="正文 Markdown/文本文件路径")
+    parser.add_argument("--content", help="正文文本（Web 端直传，与 --input 二选一）")
     parser.add_argument("--title", help="文章标题（≤30 字）")
     parser.add_argument("--cover", help="封面图路径（可选，头条可自动选正文首图）")
     parser.add_argument("--tags", default="", help="话题标签，逗号分隔（≤5 个）")
@@ -334,20 +526,28 @@ def main() -> int:
                         help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
     parser.add_argument("--headed", action="store_true", help="有头浏览器模式（调试用）")
     parser.add_argument("--timeout", type=int, default=15000, help="编辑器元素等待毫秒数")
-    args = parser.parse_args()
+    args = parser.parse_args(args_list)
 
     if args.login:
         return login(args.login_wait, headed=True)
 
-    if not args.input or not args.title:
-        parser.error("发布需要 --input 与 --title（或用 --login / --selftest）")
+    if args.input and args.content:
+        parser.error("--input 与 --content 只能给一个")
+    if not args.title or not (args.input or args.content):
+        parser.error("发布需要 --title 加 --input 或 --content"
+                     "（或用 login / whoami / --login / --selftest）")
 
-    src = _resolve(args.input)
-    if not src.is_file():
-        die(f"内容文件不存在：{src}")
-    content = src.read_text(encoding="utf-8").strip()
+    if args.content:
+        content = args.content.strip()
+        source = "--content"
+    else:
+        src = _resolve(args.input)
+        if not src.is_file():
+            die(f"内容文件不存在：{src}")
+        content = src.read_text(encoding="utf-8").strip()
+        source = str(src)
     if not content:
-        die("内容文件为空")
+        die("内容为空")
 
     title = args.title.strip()
     if len(title) > TITLE_LIMIT:
@@ -364,7 +564,7 @@ def main() -> int:
 
     print(f"[{'DRY-RUN' if dry_run else 'EXEC'}] 今日头条图文发布", file=sys.stderr)
     print(f"  标题: {title}（{len(title)} 字）", file=sys.stderr)
-    print(f"  正文: {src}（{len(content)} 字）· 话题 {len(tags)} 个"
+    print(f"  正文: {source}（{len(content)} 字）· 话题 {len(tags)} 个"
           f"{' · 存草稿' if args.draft else ''}", file=sys.stderr)
 
     result = publish_article(content, title, tags, cover, dry_run,
