@@ -194,6 +194,8 @@ def _heal_openclaw_session(sk: str) -> None:
 # 制作层/直接执行层/chat 超时统一走 easel/timeouts.py（CLI/Web/skill 三入口单一真相源）
 
 SHARED_SCRIPTS = PROJECT_ROOT / "skills" / "shared" / "scripts"
+# 头条发布脚本是自带 SKILL 的专用 publisher（与 xhs/douyin 同款），不在 shared/scripts 下。
+TOUTIAO_SCRIPTS = PROJECT_ROOT / "skills" / "openclaw" / "skill-toutiao-publisher" / "scripts"
 if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
@@ -222,6 +224,8 @@ LOGIN_RUNNERS: dict[str, dict] = {
     "zhihu": {"name": "知乎", "backend": "web", "wp": "zhihu", "profile": "ZhihuProfile"},
     "bilibili": {"name": "B站", "backend": "biliup"},
     "douyin": {"name": "抖音", "backend": "douyin", "profile": "DouyinProfile"},
+    # 今日头条：自带专用 publisher（skill-toutiao-publisher），backend=='toutiao' 在各处分派。
+    "toutiao": {"name": "今日头条", "backend": "toutiao", "profile": "ToutiaoProfile"},
     # 微信公众号：扫码登录后台会话（发布+数据都走它），backend=='wechat-oa' 在各处单独分支处理。
     "wechat-oa": {"name": "微信公众号", "backend": "wechat-oa"},
 }
@@ -3347,6 +3351,11 @@ async def api_login_start(platform: str):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'login',
                '--qr-out', str(qr), '--status-file', str(status),
                '--sms-code-file', str(code_file), '--timeout', str(LOGIN_TIMEOUT)]
+    elif backend == 'toutiao':
+        # 头条自带专用 publisher：login 子命令 headless 抠二维码 + 写 login_state 状态文件
+        cmd = [sys.executable, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'), 'login',
+               '--qr-out', str(qr), '--status-file', str(status),
+               '--timeout', str(LOGIN_TIMEOUT)]
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'login-qr',
                '--platform', cfg['wp'], '--qr-out', str(qr), '--status-file', str(status),
@@ -3556,6 +3565,8 @@ async def api_account_whoami(platform: str):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy']
     elif backend == 'douyin':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami']
+    elif backend == 'toutiao':
+        cmd = [sys.executable, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'), 'whoami']
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
                '--platform', cfg['wp']]
@@ -3870,6 +3881,12 @@ async def api_publish(platform: str, req: PublishRequest):
         code_file = PUBLISH_DIR / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
         return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+    elif platform == 'toutiao':
+        # 头条图文：正文走 --content 直传（不落临时文件）。一键发布 → --exec；
+        # 发布页选了「存草稿」时改用 --draft（只落后台草稿箱，不点发布按钮）。
+        cmd = [py, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'),
+               '--content', req.body, '--title', title, '--tags', tags]
+        cmd.append('--draft' if getattr(req, 'draft', False) else '--exec')
     elif platform == 'wechat-oa':
         # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
         # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
