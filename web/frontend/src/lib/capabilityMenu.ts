@@ -1,5 +1,5 @@
 /* 能力菜单数据（笔入口「能做的都在这」用）
- * 113 个技能的展示名/分组/状态 + 整片管线接入位。
+ * 115 个技能的展示名/分组/状态 + 整片管线接入位。
  * 技能集更新时随技能库重新生成。 */
 export interface CapabilityItem { id?: string; label: string; desc?: string; skill?: string | null; status?: string; }
 export interface CapabilityGroup { id?: string; label: string; items: CapabilityItem[]; }
@@ -8,7 +8,7 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
  "meta": {
   "name": "Easel 能力菜单",
   "version": "v1-draft",
-  "date": "2026-09-17",
+  "date": "2026-10-03",
   "legend": {
    "done": "已验（真机跑过 · 有产物）",
    "ready": "可用（工具就绪 · 未真跑）",
@@ -17,7 +17,7 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
   },
   "counts": {
    "done": 7,
-   "ready": 96,
+   "ready": 97,
    "need": 10,
    "incoming": 1
   }
@@ -408,6 +408,12 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
        "skill": "skill-wechat-publisher",
        "label": "公众号",
        "desc": "微信公众号文章自动创作与发布工具。给定参考文章、文字或文档，自动搜索整理全网相关信息、生成图文并茂的公众号文章，并发布到微信公众号草稿箱。特别强调反 AI 检测写作。 触发场景（沾边就用）：用户提到\"公众号 / 微信文章",
+       "status": "ready"
+      },
+      {
+       "skill": "skill-toutiao-publisher",
+       "label": "今日头条",
+       "desc": "今日头条（头条号）图文发布：把已成稿的文章发布到 mp.toutiao.com，支持标题、 封面、话题标签、存草稿与直接发布，走 Playwright 浏览器自动化 + 登录态持久化。 当用户说\"发头条\"\"发布到今日头条\"\"头条号发文章\"\"同步到头条\"\"头条存草稿\"\"头条图文发布\"时使用。 与 skill-cross-platform-publish 的区别：那个是一稿多发的编排层，本 SKILL 只管头条单平台落地发布； 正文生产交给制作层 SKILL（copywriting / article-outline）。",
        "status": "ready"
       },
       {

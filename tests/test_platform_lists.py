@@ -72,6 +72,26 @@ def test_publish_page_lists_toutiao():
     assert "'toutiao'" in publishable.group(1), "PUBLISHABLE 里应含 toutiao"
 
 
+LIB = PROJECT_ROOT / "web" / "frontend" / "src" / "lib"
+SKILL_NAMES = LIB / "skillDisplayNames.ts"
+CAPABILITY = LIB / "capabilityMenu.ts"
+
+
+def test_skill_display_name_includes_toutiao():
+    """技能库 / 搜索里的中文名（缺了会显示英文 id skill-toutiao-publisher）。"""
+    src = SKILL_NAMES.read_text(encoding="utf-8")
+
+    assert "'skill-toutiao-publisher': '今日头条'" in src, "技能库缺头条中文名"
+
+
+def test_capability_menu_lists_toutiao_publisher():
+    """「笔」能力菜单的「发布分发」组里要能选到头条（它不随技能库自动生成）。"""
+    src = CAPABILITY.read_text(encoding="utf-8")
+
+    assert '"skill": "skill-toutiao-publisher"' in src, "能力菜单缺头条条目"
+    assert '"label": "今日头条"' in src, "能力菜单缺头条中文标签"
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     """画像目录换到沙箱；后台 AI 增强打桩（否则测试会真起 agent）。"""
