@@ -227,3 +227,36 @@ def test_content_is_published_without_temp_file(monkeypatch, tmp_path):
     assert tp.main() == 0
     assert captured["content"] == "第一段\n\n第二段"
     assert captured["title"] == "标题"
+
+
+def test_login_launch_failure_writes_error_state(monkeypatch, tmp_path):
+    """浏览器起不来（内核没装 / profile 被占用）也必须把状态写成 error。
+
+    真机踩到过：launch 抛异常时状态文件卡在 starting，前端只能等进程退出兜底兜出来。
+    """
+    import login_state
+
+    qr, sf = tmp_path / "q.png", tmp_path / "s.json"
+
+    class BoomChromium:
+        @staticmethod
+        def launch_persistent_context(*a, **k):
+            raise RuntimeError("Executable doesn't exist at .../chrome-headless-shell.exe")
+
+    class BoomPlaywright:
+        chromium = BoomChromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(tp, "_require_playwright", lambda: (lambda: BoomPlaywright()))
+
+    assert tp.main(["login", "--qr-out", str(qr), "--status-file", str(sf)]) == 1
+
+    data = json.loads(sf.read_text(encoding="utf-8"))
+    assert data["state"] == "error", f"状态应立刻变 error，实际：{data}"
+    assert "Executable" in data["message"], data["message"]
+    assert login_state is not None  # 协议模块确实被用到

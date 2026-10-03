@@ -299,12 +299,13 @@ def _qr_login(profile: Path, qr_out: Path, status_file: Path, timeout_s: int,
     qr_out.parent.mkdir(parents=True, exist_ok=True)
     login_state.write_status(str(status_file), "starting", "启动浏览器…")
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            str(profile), headless=not headed, locale="zh-CN", args=LAUNCH_ARGS,
-            viewport={"width": 1440, "height": 900},
-        )
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ctx = None
         try:
+            ctx = pw.chromium.launch_persistent_context(
+                str(profile), headless=not headed, locale="zh-CN", args=LAUNCH_ARGS,
+                viewport={"width": 1440, "height": 900},
+            )
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             if _is_logged_in(page):
@@ -332,10 +333,13 @@ def _qr_login(profile: Path, qr_out: Path, status_file: Path, timeout_s: int,
             login_state.write_status(str(status_file), "expired", "二维码超时未扫")
             return 1
         except Exception as exc:
+            # 浏览器起不来（内核没装 / profile 被占用）也必须把状态写成 error：
+            # 真机踩到过——launch 抛异常时状态文件卡在 starting，前端只能等进程退出才兜出失败。
             login_state.write_status(str(status_file), "error", f"登录失败：{exc}")
             return 1
         finally:
-            ctx.close()
+            if ctx is not None:
+                ctx.close()
 
 
 def _probe_identity(headed: bool = False) -> dict:
