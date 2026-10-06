@@ -9,6 +9,10 @@ All notable changes to Easel are documented in this file.
 - Added Toutiao (今日头条) support: a new `skill-toutiao-publisher` publishing articles to the Toutiao creator backend (mp.toutiao.com) via Playwright with a persisted login profile, plus draft-only mode, cover upload, topic tags, and a 30-character title guard. Skill count is now 115.
 - Registered `toutiao` in the cross-platform dispatch registry (`publish_dispatch.py`) with its format constraints, and added the publisher script to the release-safety contract check in `scripts/validate_skills.py`.
 
+### Improved
+
+- Extended `skill-algorithm-updates` to cover Toutiao (今日头条) — default platform list, official sources, and algorithm vocabulary — and added a Toutiao row to the shared `pillar-and-cadence.md` cadence baseline.
+
 ## [0.2.1] - 2026-09-24
 
 ### Added

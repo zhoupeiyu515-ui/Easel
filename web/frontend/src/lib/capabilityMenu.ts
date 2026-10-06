@@ -479,7 +479,7 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
       {
        "skill": "skill-algorithm-updates",
        "label": "算法规则追踪",
-       "desc": "追踪抖音、小红书、B站、微博、知乎和视频号的算法、推荐分发、审核与变现规则变化，并分析对创作者的影响。 当用户说“算法/推荐机制变了吗、流量规则更新、为什么流量下降、平台规则变化”时使用。 内容热点用 skill-tre",
+       "desc": "追踪抖音、小红书、B站、微博、知乎、视频号和今日头条的算法、推荐分发、审核与变现规则变化，并分析对创作者的影响。 当用户说“算法/推荐机制变了吗、流量规则更新、为什么流量下降、平台规则变化”时使用。 内容热点用 skill-tre",
        "status": "ready"
       }
      ]
