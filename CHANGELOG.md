@@ -14,6 +14,7 @@ All notable changes to Easel are documented in this file.
 - Extended `skill-algorithm-updates` to cover Toutiao (今日头条) — default platform list, official sources, and algorithm vocabulary — and added a Toutiao row to the shared `pillar-and-cadence.md` cadence baseline.
 
 - Extended `skill-cross-platform-diff` to cover Toutiao (今日头条) across its supported-platform list, default scan set, comparison-matrix template, and platform-traits reference.
+- Added a Toutiao (今日头条) entry to `social-content` platform specs: title/body length, image and tag guidance, posting windows, and platform rules for the editorial drafting workflow.
 
 ## [0.2.1] - 2026-09-24
 
