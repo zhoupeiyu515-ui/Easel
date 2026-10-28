@@ -3669,7 +3669,7 @@ async def api_logout(platform: str):
 
 # 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies 不起浏览器、
 # wechat-oa 走 mp 后台会话 Playwright 拦截数据 XHR）
-ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa"}
+ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa", "toutiao"}
 
 
 @app.get("/api/analytics/platforms")
@@ -3727,6 +3727,8 @@ class PublishRequest(BaseModel):
     body: str = ''
     media: list[str] = []
     tags: str = ''
+    # 存草稿：仅今日头条支持（落后台草稿箱，不公开发布）。其他平台忽略此字段。
+    draft: bool = False
 
 
 def _write_publish_status(status_file: Path, state: str, message: str = '') -> None:
@@ -3858,6 +3860,9 @@ async def api_publish(platform: str, req: PublishRequest):
         raise HTTPException(400, f"{cfg['name']} 只能发视频，请附带一个视频文件")
     title = req.title.strip() or req.body.strip()[:20]
     tags = req.tags or ''
+    # 存草稿：仅今日头条支持（落后台草稿箱，不公开发布）。其他平台即便传了 draft
+    # 也按「直接发布」处理——不能让草稿意图落到会真发的平台上。
+    is_draft = platform == 'toutiao' and req.draft
     py = sys.executable
     if platform == 'xiaohongshu':
         base = [py, str(SHARED_SCRIPTS / 'xhs_publish.py')]
@@ -3884,9 +3889,12 @@ async def api_publish(platform: str, req: PublishRequest):
     elif platform == 'toutiao':
         # 头条图文：正文走 --content 直传（不落临时文件）。一键发布 → --exec；
         # 发布页选了「存草稿」时改用 --draft（只落后台草稿箱，不点发布按钮）。
+        # 附件图片全部走 --images 插进正文（头条会自动取正文首图作封面）。
         cmd = [py, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'),
                '--content', req.body, '--title', title, '--tags', tags]
-        cmd.append('--draft' if getattr(req, 'draft', False) else '--exec')
+        if imgs:
+            cmd += ['--images', ','.join(imgs)]
+        cmd.append('--draft' if is_draft else '--exec')
     elif platform == 'wechat-oa':
         # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
         # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
@@ -3946,12 +3954,14 @@ async def api_publish(platform: str, req: PublishRequest):
             items = _read_schedule()
             items.append({'id': uuid.uuid4().hex[:12], 'title': title,
                           'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published',
+                          'time': time.strftime('%H:%M'),
+                          'status': 'draft' if is_draft else 'published',
                           'note': req.body[:200], 'kind': 'content', 'source': 'publish-page'})
             _write_schedule(items)
         except Exception:
             pass
-    return {'ok': ok, 'message': '发布成功' if ok else '发布失败（见 detail）', 'detail': detail}
+    return {'ok': ok, 'message': ('已存草稿' if is_draft else '发布成功') if ok else '发布失败（见 detail）',
+            'detail': detail}
 
 
 class ProfileBuildRequest(BaseModel):

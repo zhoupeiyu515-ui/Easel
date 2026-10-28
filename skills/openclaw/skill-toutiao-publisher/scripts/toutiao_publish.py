@@ -18,6 +18,11 @@
   python skills/openclaw/skill-toutiao-publisher/scripts/toutiao_publish.py \
       --input outputs/主题名/article.md --title "文章标题" --cover outputs/主题名/cover.png --exec
 
+  # 带正文插图（--images 逗号分隔；正文里独占一行的 ![](路径) 决定插图位置）：
+  python skills/openclaw/skill-toutiao-publisher/scripts/toutiao_publish.py \
+      --input outputs/主题名/article.md --title "文章标题" \
+      --images outputs/主题名/fig1.png,outputs/主题名/fig2.png --exec
+
 依赖：playwright + chromium（`pip install playwright && playwright install chromium`）。
 登录态持久化在 ~/.easel-browser-profiles/ToutiaoProfile（与其它平台 publisher 同款方案）。
 """
@@ -27,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -77,13 +83,49 @@ BODY_SELECTORS = [
 BODY_IFRAME_SELECTORS = ["iframe[id*='ueditor']", "iframe[class*='editor']"]
 SUBMIT_SELECTORS = [
     "button:has-text('预览并发布')",
+    "text=预览并发布",
     "button:has-text('发布')",
-    "button:has-text('存草稿')",
     "div.publish-btn",
 ]
+# 头条号没有「存草稿」按钮——草稿是自动保存的（真机 2026-10 校准）。
 
 # 正文输入后必须出现的确认态（发布成功页特征），用于判定是否真的发出去了。
 SUCCESS_HINTS = ("发布成功", "已发布", "内容管理", "草稿箱")
+
+# 正文里的图片占位符：独占一行的 ![说明](路径)。命中 --images 里的图 → 在该位置插图。
+IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+
+# 编辑器里已插入的图片（用于判断一次上传是否真的落进去了）
+EDITOR_IMG_SELECTOR = ".ProseMirror img, div[contenteditable='true'] img, .editor-content img"
+
+# 正文编辑器的「插入图片」入口——头条号是字节 syl-* 组件，工具栏工具的类名带版本前缀，
+# 多策略逐个试（和标题/正文选择器同款思路：改版频繁，多路比单点耐改）。
+# 第一条是真机校准过的（2026-10）：字节系工具栏的图片工具 class 就是 "image"。
+IMAGE_BUTTON_SELECTORS = [
+    ".syl-toolbar-tool.image",
+    "button:has-text('图片')",
+    "[aria-label*='图片']",
+    "[title*='图片']",
+    "[data-tooltip*='图片']",
+    "[class*='toolbar'] [class*='image']",
+    "[class*='toolbar'] [class*='pic']",
+    "[class*='editor'] [class*='image']",
+]
+# 图片面板里的「确定」——上传完必须点它，图才会进编辑器（真机踩过：漏这一步图只进素材区）
+IMAGE_CONFIRM_SELECTORS = [
+    "button:has-text('确定')",
+    ".byte-btn:has-text('确定')",
+    "text=确定",
+]
+# 面板里已上传的图片缩略图（用来判断上传是否完成）
+UPLOADED_THUMB_SELECTORS = "ul.image-list img, .pic-select-image-item img"
+# 封面设置区里的 file input（页面上往往有多个 file input，挑错就传错位置）
+COVER_INPUT_SELECTORS = [
+    "[class*='cover'] input[type='file']",
+    "[class*='Cover'] input[type='file']",
+    "[class*='poster'] input[type='file']",
+    "[class*='封面'] input[type='file']",
+]
 
 # 登录页二维码元素：头条登录走字节 SSO，二维码可能在 <img> / <canvas> / 内嵌组件里，
 # 且后台改版频繁——多选择器逐个试，全不中退回整页截图（宁可给大图，也别给空图）。
@@ -144,29 +186,196 @@ def _fill_title(page, title: str, timeout_ms: int) -> bool:
     return True
 
 
-def _fill_body(page, body: str, timeout_ms: int) -> bool:
-    el = _first_match(page, BODY_SELECTORS, timeout_ms)
-    if el is not None:
-        el.click()
-        # 富文本编辑器用 insert_text 逐段写入，避免 type() 在长文下过慢。
-        for para in [p for p in body.split("\n") if p.strip()]:
-            page.keyboard.insert_text(para)
-            page.keyboard.press("Enter")
-        return True
-    # 回退：正文编辑器在 iframe 里（老版 ueditor）
-    for frame_sel in BODY_IFRAME_SELECTORS:
+def _editor_img_count(page) -> int:
+    """编辑器里已插入的图片数（用来判断一次上传是否真的落进正文）。"""
+    try:
+        return page.locator(EDITOR_IMG_SELECTOR).count()
+    except Exception:
+        return 0
+
+
+def _try_set_file_input(page, scope_sel: str, path: Path, timeout_ms: int,
+                        before_count: int) -> bool:
+    """在 scope_sel 范围内找 file input 塞图，等编辑器里图片数增加。
+
+    set_input_files 对隐藏 input 也能生效（不要求可见），所以弹层里的隐藏 input 照样能用。
+    """
+    try:
+        inputs = page.locator(scope_sel)
+        if not inputs.count():
+            return False
+        inputs.first.set_input_files(str(path))
+    except Exception:
+        return False
+    deadline = time.time() + max(timeout_ms, 8000) / 1000
+    while time.time() < deadline:
+        if _editor_img_count(page) > before_count:
+            page.wait_for_timeout(500)   # 等平台把图传完并插入
+            return True
+        page.wait_for_timeout(400)
+    return False
+
+
+def _upload_via_panel(page, path: Path, timeout_ms: int, before_count: int) -> bool:
+    """图片面板流程（真机 2026-10 校准的头条号图文编辑器）：
+
+      面板已打开 → 给面板里**可见的** file input 塞图 → 平台传自己 CDN，面板出现缩略图
+      → 点面板底部「确定」→ 图片才插进编辑器当前光标处。
+
+    漏掉「确定」这一步，图只会停在面板的素材区，编辑器里不会有图——这是真机踩过的坑。
+    """
+    try:
+        inputs = page.locator("input[type=file]:visible")
+        if not inputs.count():
+            return False
+        inputs.first.set_input_files(str(path))
+    except Exception:
+        return False
+
+    # 等平台把图传完并渲染出缩略图
+    deadline = time.time() + max(timeout_ms, 20000) / 1000
+    uploaded = False
+    while time.time() < deadline:
         try:
-            frame_el = page.locator(frame_sel).first
-            if not frame_el.count():
-                continue
-            frame = frame_el.content_frame
-            if frame:
-                frame.locator("body").click()
-                frame.locator("body").type(body, delay=5)
-                return True
+            if page.locator(UPLOADED_THUMB_SELECTORS).count() > 0:
+                uploaded = True
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    if not uploaded:
+        return False
+
+    confirm = _first_match(page, IMAGE_CONFIRM_SELECTORS, 4000)
+    if confirm is None:
+        return False
+    try:
+        confirm.click()
+    except Exception:
+        return False
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if _editor_img_count(page) > before_count:
+            page.wait_for_timeout(500)   # 等平台把图写进文档
+            return True
+        page.wait_for_timeout(400)
+    return False
+
+
+def _upload_inline_image(page, path: Path, timeout_ms: int) -> bool:
+    """在编辑器当前光标处插入一张图，返回是否成功。
+
+    头条号正文是 ProseMirror 富文本：给 <img src="本地路径"> 会被编辑器清掉，
+    必须走编辑器的图片上传控件，让平台自己把图传上 CDN 再写进文档。
+    策略从稳到险逐个试，全不中返回 False（调用方据此阻断发布，不静默发成纯文字）。
+    """
+    before = _editor_img_count(page)
+
+    # 策略 1：编辑器容器里直接挂着 file input 的版本（部分实现如此，不用点工具栏）
+    if _try_set_file_input(page, "div[contenteditable='true'] input[type='file']",
+                           path, timeout_ms, before):
+        return True
+
+    # 策略 2：点工具栏「图片」→ 面板上传 → 点「确定」插入
+    for btn_sel in IMAGE_BUTTON_SELECTORS:
+        btn = _first_match(page, [btn_sel], 1500)
+        if btn is None:
+            continue
+        try:
+            btn.click()
         except Exception:
             continue
+        page.wait_for_timeout(800)
+        if _upload_via_panel(page, path, timeout_ms, before):
+            return True
     return False
+
+
+def _fill_body(page, body: str, images: list[Path], timeout_ms: int) -> tuple[bool, list[str]]:
+    """正文填入编辑器。
+
+    images 里的图按正文中的 ![]() 占位符原位插入；正文没引用到的，追加到末尾。
+    返回 (是否填成功, 插入失败的图路径列表)——有图插失败必须让调用方知道，
+    否则会以「以为有图、其实纯文字」的形式发出去。
+    """
+    pending = {str(p.resolve()): p for p in images}
+    failed: list[str] = []
+
+    el = _first_match(page, BODY_SELECTORS, timeout_ms)
+    if el is None:
+        # 回退：正文编辑器在 iframe 里（老版 ueditor）——只能纯文字，插不了图
+        for frame_sel in BODY_IFRAME_SELECTORS:
+            try:
+                frame_el = page.locator(frame_sel).first
+                if not frame_el.count():
+                    continue
+                frame = frame_el.content_frame
+                if frame:
+                    frame.locator("body").click()
+                    frame.locator("body").type(body, delay=5)
+                    return True, [str(p) for p in images]
+            except Exception:
+                continue
+        return False, [str(p) for p in images]
+
+    el.click()
+    used: set[str] = set()
+    # 富文本编辑器用 insert_text 逐段写入，避免 type() 在长文下过慢。
+    for para in [p for p in body.split("\n") if p.strip()]:
+        m = IMAGE_LINE_RE.match(para.strip())
+        if m:
+            key = str(_resolve(m.group(2)).resolve())
+            path = pending.get(key)
+            if path is not None:
+                # 无论成功与否都算「正文引用过」——否则末尾追加会把它再插一遍
+                used.add(key)
+                if not _upload_inline_image(page, path, timeout_ms):
+                    failed.append(str(path))
+                page.keyboard.press("Enter")
+                continue
+        page.keyboard.insert_text(para)
+        page.keyboard.press("Enter")
+
+    # 正文没引用到的图：追加到末尾（头条会自动取正文首图作封面）
+    for key, path in pending.items():
+        if key in used:
+            continue
+        if not _upload_inline_image(page, path, timeout_ms):
+            failed.append(str(path))
+        page.keyboard.press("Enter")
+
+    return True, failed
+
+
+def _pick_cover_input(page):
+    """挑封面用的 file input。
+
+    页面上往往有多个 file input（正文插图一个、封面一个），用 inputs.first 会挑错。
+    优先封面区域内的；没有就挑编辑器容器之外的那个。
+    """
+    for sel in COVER_INPUT_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            if loc.count():
+                return loc.first
+        except Exception:
+            continue
+    try:
+        loc = page.locator("input[type='file']")
+        n = loc.count()
+        for i in range(n):
+            el = loc.nth(i)
+            try:
+                inside = el.evaluate(
+                    "e => !!e.closest(\"div[contenteditable='true'], .ProseMirror, .editor-content\")")
+            except Exception:
+                inside = False
+            if not inside:
+                return el
+        return loc.first if n else None
+    except Exception:
+        return None
 
 
 def _upload_cover(page, cover: Path) -> bool:
@@ -174,19 +383,39 @@ def _upload_cover(page, cover: Path) -> bool:
     if not cover.is_file():
         return False
     try:
-        inputs = page.locator("input[type='file']")
-        if not inputs.count():
+        el = _pick_cover_input(page)
+        if el is None:
             return False
-        inputs.first.set_input_files(str(cover))
+        el.set_input_files(str(cover))
         page.wait_for_timeout(1500)
         return True
     except Exception:
         return False
 
 
-def _click_submit(page, want_draft: bool) -> bool:
-    selectors = ["button:has-text('存草稿')"] if want_draft else SUBMIT_SELECTORS
-    btn = _first_match(page, selectors, 8000)
+def _wait_autosave(page, timeout_ms: int) -> bool:
+    """等头条号的草稿自动保存提示出现（页面底部「草稿保存中...」）。
+
+    真机 2026-10 校准：头条号不显示「已保存」，只有「草稿保存中...」这一个指示器
+    （偶发短暂出现「保存失败」后又重试成功）。所以这里只能确认「平台在存草稿」，
+    无法在页面层确认落库结果——真要确认得去草稿箱看。
+    """
+    deadline = time.time() + max(timeout_ms, 20000) / 1000
+    while time.time() < deadline:
+        try:
+            txt = page.inner_text("body")
+        except Exception:
+            txt = ""
+        if "草稿保存中" in txt or "草稿已保存" in txt:
+            page.wait_for_timeout(3000)   # 让这一轮保存落库
+            return True
+        page.wait_for_timeout(500)
+    return False
+
+
+def _click_submit(page) -> bool:
+    """点「预览并发布」并处理二次确认弹窗。"""
+    btn = _first_match(page, SUBMIT_SELECTORS, 8000)
     if not btn:
         return False
     btn.click()
@@ -406,12 +635,14 @@ def cmd_whoami(argv: list[str]) -> int:
 
 
 def publish_article(content: str, title: str, tags: list[str], cover: Path | None,
-                    dry_run: bool, headed: bool, as_draft: bool, timeout_ms: int) -> dict:
+                    images: list[Path], dry_run: bool, headed: bool, as_draft: bool,
+                    timeout_ms: int) -> dict:
     """把图文发到头条号。dry_run=True 时只走到编辑器填写完成，不点发布。"""
     sync_playwright = _require_playwright()
     result: dict = {"platform": "toutiao", "dry_run": dry_run, "draft": as_draft,
                     "title": title, "tags": tags,
-                    "cover": str(cover) if cover else "", "steps": {}}
+                    "cover": str(cover) if cover else "",
+                    "images": [str(p) for p in images], "steps": {}}
     with sync_playwright() as pw:
         ctx, page = _open_browser(pw, headed)
         try:
@@ -422,22 +653,47 @@ def publish_article(content: str, title: str, tags: list[str], cover: Path | Non
                 return result
 
             result["steps"]["title"] = _fill_title(page, title, timeout_ms)
-            result["steps"]["body"] = _fill_body(page, content, timeout_ms)
-            if cover:
-                result["steps"]["cover"] = _upload_cover(page, cover)
+            body_ok, failed_images = _fill_body(page, content, images, timeout_ms)
+            result["steps"]["body"] = body_ok
+            # 话题先于封面：封面上传会抢走焦点，话题要在编辑器里打
             if tags:
                 result["steps"]["tags"] = _fill_tags(page, tags, timeout_ms)
+            if cover:
+                result["steps"]["cover"] = _upload_cover(page, cover)
 
             if not result["steps"]["title"] or not result["steps"]["body"]:
                 result["error"] = "编辑器定位失败（标题或正文），头条号后台可能已改版——见 references/publish-flow.md"
                 return result
 
+            # 插图失败要拦住：否则会以「以为有图、其实纯文字」的形式发出去
+            if failed_images:
+                result["error"] = ("以下图片未能插入编辑器（头条号后台可能已改版，"
+                                   "或图片格式不被接受）：\n  " + "\n  ".join(failed_images))
+                return result
+            result["steps"]["images"] = True
+
             if dry_run:
-                result["note"] = "dry-run：内容已填入编辑器，未点击发布"
+                result["note"] = ("dry-run：内容已填入编辑器，未点击发布。"
+                                  "注意：头条号会自动保存草稿，dry-run 也会在草稿箱留下一份。")
                 return result
 
-            if not _click_submit(page, as_draft):
-                result["error"] = "未找到发布/存草稿按钮"
+            if as_draft:
+                # 头条号没有「存草稿」按钮——草稿是自动保存的（真机 2026-10 校准：
+                # 页面上只有 预览 / 定时发布 / 预览并发布，草稿提示是「草稿将自动保存」）。
+                # 所以「存草稿」= 填完内容就停，等平台自动保存，绝不点「预览并发布」。
+                saved = _wait_autosave(page, timeout_ms)
+                result["steps"]["draft"] = saved
+                result["published"] = False
+                result["url"] = page.url
+                if not saved:
+                    result["error"] = "未看到草稿自动保存提示，草稿可能没存上"
+                else:
+                    result["note"] = ("已触发草稿自动保存，未公开发布。"
+                                      "平台不显示保存完成提示，可在草稿箱核对是否落库。")
+                return result
+
+            if not _click_submit(page):
+                result["error"] = "未找到「预览并发布」按钮"
                 return result
             body_text = page.inner_text("body")
             result["published"] = any(h in body_text for h in SUCCESS_HINTS)
@@ -447,17 +703,67 @@ def publish_article(content: str, title: str, tags: list[str], cover: Path | Non
     return result
 
 
+def _insert_topic(page, tag: str, timeout_ms: int) -> bool:
+    """在编辑器里插入一个话题节点。
+
+    头条图文编辑器没有独立的话题输入框——话题是在正文里打「#话题名」，然后从联想列表里
+    选一下才会变成真话题节点（<a class="tteditor-forum">）。真机 2026-10 校准：
+    联想项的类名是 .forum-list-item-text，文本与话题名完全一致时才点。
+    联想没出现（平台上没有这个话题）就把刚打进去的「#话题」撤掉，别在正文留半截井号。
+    """
+    before = page.locator(".ProseMirror a.tteditor-forum").count()
+    # 真机 2026-10 校准：必须先打「#」等联想面板出来，再打话题名——一次性插「#话题」
+    # 不会唤起联想（真机实测：一次性插 → 无联想项；分步插 → 有）。
+    page.keyboard.insert_text("#")
+    page.wait_for_timeout(1200)
+    page.keyboard.insert_text(tag)
+    deadline = time.time() + max(timeout_ms, 8000) / 1000
+    while time.time() < deadline:
+        hit = page.evaluate(
+            """(tag) => {
+                const els = Array.from(document.querySelectorAll('.forum-list-item-text'))
+                    .filter(e => (e.innerText || '').trim() === tag && (e.offsetWidth || e.offsetHeight));
+                if (!els.length) return false;
+                els[0].click();
+                return true;
+            }""", tag)
+        if hit:
+            page.wait_for_timeout(500)
+            if page.locator(".ProseMirror a.tteditor-forum").count() > before:
+                return True
+        page.wait_for_timeout(300)
+    for _ in range(len(tag) + 2):   # 撤掉没匹配上的「#话题」
+        page.keyboard.press("Backspace")
+    return False
+
+
 def _fill_tags(page, tags: list[str], timeout_ms: int) -> bool:
-    """话题/标签输入（头条用 # 话题，输入后回车绑定）。找不到就跳过，不阻断。"""
-    el = _first_match(page, ["input[placeholder*='话题']", "input[placeholder*='标签']"], timeout_ms)
-    if el is None:
-        return False
-    el.click()
+    """话题绑定。
+
+    先找话题/标签输入框（部分版本有）；头条图文没有独立输入框（真机 2026-10 校准），
+    退回编辑器内「#话题 → 联想 → 点选」。找不到/匹配不上就跳过，不阻断发布。
+    """
+    el = _first_match(page, ["input[placeholder*='话题']", "input[placeholder*='标签']"], 2000)
+    if el is not None:
+        el.click()
+        for tag in tags[:TAG_LIMIT]:
+            el.type(tag, delay=30)
+            page.wait_for_timeout(600)
+            page.keyboard.press("Enter")
+        return True
+
+    # 编辑器内 # 联想——光标得在正文里（封面上传会抢焦点，故话题先于封面处理）
+    try:
+        page.locator(".ProseMirror").first.click()
+        page.keyboard.press("Control+End")
+    except Exception:
+        pass
+    ok = 0
     for tag in tags[:TAG_LIMIT]:
-        el.type(tag, delay=30)
-        page.wait_for_timeout(600)
-        page.keyboard.press("Enter")
-    return True
+        if not _insert_topic(page, tag, timeout_ms):
+            break
+        ok += 1
+    return ok > 0
 
 
 def _write_record(result: dict) -> Path:
@@ -475,6 +781,10 @@ def _selftest() -> int:
     assert TITLE_SELECTORS and BODY_SELECTORS and SUBMIT_SELECTORS, "选择器表不应为空"
     assert "--disable-blink-features=AutomationControlled" in LAUNCH_ARGS, "反检测参数缺失"
     assert PUBLISH_URL.startswith("https://mp.toutiao.com/"), "发布地址应为头条号后台"
+    # 插图相关：图片按钮选择器 + 正文占位符解析
+    assert IMAGE_BUTTON_SELECTORS and IMAGE_CONFIRM_SELECTORS, "插图选择器表不应为空"
+    assert IMAGE_LINE_RE.match("![](outputs/x/a.png)"), "图片占位符正则应能匹配 ![]()"
+    assert not IMAGE_LINE_RE.match("普通段落"), "图片占位符正则不该匹配普通文字"
     # 相对路径必须挂到 PROJECT_ROOT，且产物只能落 outputs/<主题> 或注册系统目录
     assert _resolve("outputs/x/a.md") == PROJECT_ROOT / "outputs/x/a.md"
     assert _resolve(str(Path.home())).is_absolute()
@@ -522,6 +832,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--content", help="正文文本（Web 端直传，与 --input 二选一）")
     parser.add_argument("--title", help="文章标题（≤30 字）")
     parser.add_argument("--cover", help="封面图路径（可选，头条可自动选正文首图）")
+    parser.add_argument("--images", default="",
+                        help="正文插图路径，逗号分隔。正文里写成独占一行的 ![](路径) 则原位插入，"
+                             "没写占位的追加到正文末尾")
     parser.add_argument("--tags", default="", help="话题标签，逗号分隔（≤5 个）")
     parser.add_argument("--draft", action="store_true", help="存草稿而不是直接发布")
     parser.add_argument("--exec", action="store_true", dest="execute",
@@ -560,6 +873,15 @@ def main(argv: list[str] | None = None) -> int:
     cover = _resolve(args.cover) if args.cover else None
     if cover and not cover.is_file():
         die(f"封面图不存在：{cover}")
+    images: list[Path] = []
+    for raw in args.images.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        p = _resolve(raw)
+        if not p.is_file():
+            die(f"插图不存在：{p}")
+        images.append(p)
 
     dry_run = not args.execute
     # 出站内容安全闸门：真发前扫描标题/正文/话题，检出内部设置泄露即阻止发布（dry-run 只告警）。
@@ -569,9 +891,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[{'DRY-RUN' if dry_run else 'EXEC'}] 今日头条图文发布", file=sys.stderr)
     print(f"  标题: {title}（{len(title)} 字）", file=sys.stderr)
     print(f"  正文: {source}（{len(content)} 字）· 话题 {len(tags)} 个"
+          f"{' · 插图 ' + str(len(images)) + ' 张' if images else ''}"
           f"{' · 存草稿' if args.draft else ''}", file=sys.stderr)
 
-    result = publish_article(content, title, tags, cover, dry_run,
+    result = publish_article(content, title, tags, cover, images, dry_run,
                              args.headed, args.draft, args.timeout)
     if result.get("error"):
         print(json.dumps(result, ensure_ascii=False, indent=2))

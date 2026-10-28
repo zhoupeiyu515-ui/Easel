@@ -57,6 +57,7 @@ SOURCES = {"manual", "publish-page", "chat", "scheduler"}
 PLATFORM_NAMES = {
     "xiaohongshu": "小红书", "douyin": "抖音", "kuaishou": "快手",
     "weixin-channels": "微信视频号", "zhihu": "知乎", "bilibili": "B站",
+    "toutiao": "今日头条",
 }
 
 

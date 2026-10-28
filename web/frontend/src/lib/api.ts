@@ -453,10 +453,11 @@ export interface PublishResult {
 }
 
 /** 一键发布到某平台（真发布，--exec）。media 为 outputs 相对路径数组。
- * 抖音返回 {async:true}，需轮询 publishStatus；其他平台同步返回结果。 */
+ * 抖音返回 {async:true}，需轮询 publishStatus；其他平台同步返回结果。
+ * draft=true 表示存草稿（仅今日头条支持，落后台草稿箱不公开发布）。 */
 export function publishNow(
   platform: string,
-  payload: { title: string; body: string; media: string[]; tags?: string },
+  payload: { title: string; body: string; media: string[]; tags?: string; draft?: boolean },
 ): Promise<PublishResult> {
   return request<PublishResult>(`/api/publish/${encodeURIComponent(platform)}`, {
     method: 'POST',

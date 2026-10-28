@@ -29,6 +29,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "web"))
 sys.path.insert(0, str(PROJECT_ROOT / "skills" / "shared" / "scripts"))
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "openclaw"
+                       / "asset-manager" / "scripts"))
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "openclaw"
+                       / "template-library" / "scripts"))
 
 import app as web  # noqa: E402
 
@@ -70,6 +74,15 @@ def test_publish_page_lists_toutiao():
     publishable = re.search(r"const PUBLISHABLE = new Set\(\[(.*?)\]\)", src, re.S)
     assert publishable, "没找到 PUBLISHABLE 定义"
     assert "'toutiao'" in publishable.group(1), "PUBLISHABLE 里应含 toutiao"
+
+
+def test_publish_page_marks_toutiao_draft_capable():
+    """「存草稿」开关靠 PLATFORMS 条目上的 draft 标记驱动——漏标开关就不出现。"""
+    src = PUBLISH.read_text(encoding="utf-8")
+
+    m = re.search(r"\{ key: 'toutiao'[^\n]*", src)
+    assert m, "PublishPage 的 PLATFORMS 缺 toutiao 条目"
+    assert "draft: true" in m.group(0), f"toutiao 条目应标 draft: true，实际：{m.group(0)}"
 
 
 LIB = PROJECT_ROOT / "web" / "frontend" / "src" / "lib"
@@ -125,3 +138,50 @@ def test_build_writes_toutiao_section(client):
     assert f"## {TOUTIAO}" in md, md
     assert home in md, md
     assert "## 小红书" in md, md
+
+
+# --------------------------------------------------------------------------- #
+# 后端与 skill 层的平台清单（此前只钉了前端，后端漏改不会有任何测试变红）
+# --------------------------------------------------------------------------- #
+
+def test_analytics_platforms_include_toutiao():
+    """账号页「创作数据」的平台清单——缺了头条 → /api/analytics/toutiao 直接 404。"""
+    assert "toutiao" in web.ANALYTICS_PLATFORMS, sorted(web.ANALYTICS_PLATFORMS)
+
+
+def test_account_stats_supports_toutiao():
+    """数据回收脚本的平台配置——ANALYTICS_PLATFORMS 的下游依赖。"""
+    import account_stats
+
+    assert "toutiao" in account_stats.PLATFORMS, sorted(account_stats.PLATFORMS)
+    cfg = account_stats.PLATFORMS["toutiao"]
+    assert cfg["profile"] == "ToutiaoProfile", cfg
+    assert cfg["url"].startswith("https://mp.toutiao.com/"), cfg
+    assert "粉丝数" in cfg["overview"]["followers"], cfg
+    assert cfg["metrics"], "头条应有作品数据指标"
+
+
+def test_calendar_platform_names_include_toutiao():
+    """内容日历的平台码→中文名映射——缺了会显示成原始码 toutiao。"""
+    import calendar_ops
+
+    assert calendar_ops.PLATFORM_NAMES.get("toutiao") == TOUTIAO, calendar_ops.PLATFORM_NAMES
+
+
+def test_cross_platform_publish_skill_routes_toutiao():
+    """跨平台发布的路由表——agent 读的是这张表，漏了就不会路由到头条。"""
+    md = (PROJECT_ROOT / "skills" / "openclaw"
+          / "skill-cross-platform-publish" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "skill-toutiao-publisher" in md, "路由表缺头条 publisher"
+    assert "toutiao" in md, "路由表缺 toutiao 平台码"
+
+
+def test_asset_and_template_libs_know_toutiao():
+    """素材库的平台识别与模板库分类——头条素材/模板要能被归类。"""
+    import assets
+    import templates
+
+    assert "toutiao" in assets.PLATFORMS, assets.PLATFORMS
+    assert assets.PLATFORM_ALIASES.get(TOUTIAO) == "toutiao", assets.PLATFORM_ALIASES
+    assert "toutiao" in templates.CATEGORIES, templates.CATEGORIES

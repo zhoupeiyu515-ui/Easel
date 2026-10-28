@@ -65,9 +65,9 @@ def test_dry_run_fills_editor_without_publishing(monkeypatch, article, tmp_path)
     """默认 dry-run：把内容交给编辑器但不点发布，tags 正确拆分。"""
     captured: dict = {}
 
-    def fake_publish(content, title, tags, cover, dry_run, headed, as_draft, timeout_ms):
+    def fake_publish(content, title, tags, cover, images, dry_run, headed, as_draft, timeout_ms):
         captured.update(content=content, title=title, tags=tags, cover=cover,
-                        dry_run=dry_run, draft=as_draft)
+                        images=images, dry_run=dry_run, draft=as_draft)
         return {"platform": "toutiao", "dry_run": dry_run,
                 "steps": {"title": True, "body": True}}
 
@@ -82,6 +82,7 @@ def test_dry_run_fills_editor_without_publishing(monkeypatch, article, tmp_path)
     assert captured["draft"] is False
     assert captured["tags"] == ["AI", "效率工具"]
     assert captured["title"] == "标题"
+    assert captured["images"] == []
 
 
 def test_publish_dispatch_routes_toutiao_to_this_skill():
@@ -107,12 +108,36 @@ def test_skill_frontmatter_contract():
     assert "layer: publish" in head
     assert len(text.splitlines()) <= 200
 
-
 @pytest.mark.parametrize("placeholder", [
     "mp.toutiao.com", "ToutiaoProfile", "outputs/_publish",
 ])
 def test_skill_documents_key_entrypoints(placeholder):
     assert placeholder in SKILL_MD.read_text(encoding="utf-8")
+
+
+def test_skill_documents_real_machine_calibrated_flows():
+    """SKILL.md 必须写清真机校准出的三件事，否则使用者会按旧直觉踩坑。
+
+    1) 头条没有「存草稿」按钮，草稿自动保存（dry-run 也会留草稿）
+    2) 插图要靠「#占位符」决定位置
+    3) 话题是编辑器内 # 联想
+    """
+    text = SKILL_MD.read_text(encoding="utf-8")
+
+    assert "自动保存" in text, "SKILL.md 应说明草稿是自动保存的"
+    assert "dry-run" in text and "草稿箱" in text, "SKILL.md 应提醒 dry-run 也会留草稿"
+    assert "--images" in text, "SKILL.md 应记录 --images 用法"
+    assert "![](" in text, "SKILL.md 应说明正文里的图片占位符写法"
+    assert "话题" in text and "#" in text, "SKILL.md 应说明话题是正文内 # 联想"
+
+
+def test_publish_flow_doc_records_real_selectors():
+    """references/publish-flow.md 是排障时的唯一依据，得记着实测选择器。"""
+    ref = (SKILL_DIR / "references" / "publish-flow.md").read_text(encoding="utf-8")
+
+    for needle in (".syl-toolbar-tool.image", ".forum-list-item-text",
+                   "tteditor-forum", "草稿保存中", "「确定」"):
+        assert needle in ref, f"publish-flow.md 缺真机校准结论：{needle}"
 
 
 # ---------- Web 工作台接入契约（login / whoami / --content） ----------
@@ -215,7 +240,7 @@ def test_content_is_published_without_temp_file(monkeypatch, tmp_path):
     """--content 直接把正文送进发布流程，不读文件。"""
     captured: dict = {}
 
-    def fake_publish(content, title, tags, cover, dry_run, headed, as_draft, timeout_ms):
+    def fake_publish(content, title, tags, cover, images, dry_run, headed, as_draft, timeout_ms):
         captured.update(content=content, title=title, tags=tags)
         return {"platform": "toutiao", "steps": {"title": True, "body": True}}
 
@@ -260,3 +285,173 @@ def test_login_launch_failure_writes_error_state(monkeypatch, tmp_path):
     assert data["state"] == "error", f"状态应立刻变 error，实际：{data}"
     assert "Executable" in data["message"], data["message"]
     assert login_state is not None  # 协议模块确实被用到
+
+
+# --------------------------------------------------------------------------- #
+# 正文插图（--images）
+# --------------------------------------------------------------------------- #
+
+class _FakeKeyboard:
+    def __init__(self, page):
+        self.page = page
+
+    def insert_text(self, text):
+        self.page.events.append(("text", text))
+
+    def press(self, key):
+        self.page.events.append(("press", key))
+
+
+class _FakeLocator:
+    def __init__(self, page, sel):
+        self.page = page
+        self.sel = sel
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        if self.sel == tp.EDITOR_IMG_SELECTOR:
+            return self.page.img_count
+        if self.sel in tp.BODY_SELECTORS:
+            return 1
+        if self.sel in tp.IMAGE_BUTTON_SELECTORS:
+            return 1
+        if self.sel in tp.IMAGE_CONFIRM_SELECTORS:
+            return 1
+        if self.sel == tp.UPLOADED_THUMB_SELECTORS:
+            return self.page.pending
+        if self.sel == "input[type=file]:visible":
+            return 1
+        if self.sel == "div[contenteditable='true'] input[type='file']":
+            return 1 if self.page.editor_has_file_input else 0
+        return 0
+
+    def is_visible(self):
+        return True
+
+    def click(self):
+        self.page.clicked.append(self.sel)
+        self.page.events.append(("click", self.sel))
+        # 点「确定」= 面板里待插入的图进编辑器（真机 2026-10 校准的第三步）
+        if self.sel in tp.IMAGE_CONFIRM_SELECTORS and self.page.pending:
+            self.page.img_count += self.page.pending
+            self.page.pending = 0
+
+    def set_input_files(self, path):
+        self.page.uploaded.append(path)
+        self.page.events.append(("upload", path))
+        if self.sel == "div[contenteditable='true'] input[type='file']":
+            self.page.img_count += 1      # 编辑器自带 input：塞进去直接就是正文里的图
+        else:
+            self.page.pending += 1         # 面板上传：要等点「确定」才进正文
+
+
+class _FakePage:
+    """够用的假浏览器：按顺序记录「打字 / 上传图 / 点按钮」，用来验证插图位置。"""
+
+    def __init__(self, editor_has_file_input=True):
+        self.events = []
+        self.keyboard = _FakeKeyboard(self)
+        self.uploaded = []
+        self.clicked = []
+        self.img_count = 0
+        self.pending = 0
+        self.editor_has_file_input = editor_has_file_input
+
+    def locator(self, sel):
+        return _FakeLocator(self, sel)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def _event_kinds(page):
+    return [(k, str(v)) for k, v in page.events]
+
+
+def test_fill_body_inserts_images_at_placeholder_positions(tmp_path):
+    """正文里独占一行的 ![]() 占位符 → 图插在那个位置。"""
+    img = tmp_path / "fig1.png"
+    img.write_bytes(b"x")
+    page = _FakePage()
+
+    body = f"第一段\n\n![]({img})\n\n第二段"
+    ok, failed = tp._fill_body(page, body, [img], 1000)
+
+    assert ok is True
+    assert failed == [], failed
+    assert [Path(p).name for p in page.uploaded] == ["fig1.png"], page.uploaded
+
+    # 顺序：先打「第一段」→ 上传图 → 再打「第二段」
+    text_idx = [i for i, (k, _) in enumerate(page.events) if k == "text"]
+    upload_idx = [i for i, (k, _) in enumerate(page.events) if k == "upload"]
+    assert len(text_idx) == 2 and len(upload_idx) == 1, page.events
+    assert text_idx[0] < upload_idx[0] < text_idx[1], page.events
+    texts = [v for k, v in _event_kinds(page) if k == "text"]
+    assert texts == ["第一段", "第二段"], texts
+
+
+def test_fill_body_appends_unreferenced_images_at_end(tmp_path):
+    """正文没引用到的图 → 追加到末尾，而不是丢掉。"""
+    img = tmp_path / "fig2.png"
+    img.write_bytes(b"x")
+    page = _FakePage()
+
+    ok, failed = tp._fill_body(page, "只有一段文字", [img], 1000)
+
+    assert ok is True
+    assert failed == [], failed
+    assert [Path(p).name for p in page.uploaded] == ["fig2.png"], page.uploaded
+
+
+def test_fill_body_falls_back_to_toolbar_when_no_editor_file_input(tmp_path):
+    """编辑器里没有 file input 时，走「工具栏图片工具 → 面板上传 → 点确定」三步。"""
+    img = tmp_path / "fig3.png"
+    img.write_bytes(b"x")
+    page = _FakePage(editor_has_file_input=False)
+
+    ok, failed = tp._fill_body(page, f"![]({img})", [img], 1000)
+
+    assert ok is True
+    assert failed == [], failed
+    assert [Path(p).name for p in page.uploaded] == ["fig3.png"], page.uploaded
+    # 真机三步：点工具栏图片工具 → 塞图 → 点「确定」才进正文
+    assert ".syl-toolbar-tool.image" in page.clicked, page.clicked
+    assert any("确定" in c for c in page.clicked), page.clicked
+    assert page.img_count == 1, page.img_count
+
+
+def test_missing_image_file_errors(monkeypatch, tmp_path, capsys):
+    """--images 里有不存在的图 → 直接报错退出，不起浏览器。"""
+    monkeypatch.setattr(sys, "argv", [
+        "toutiao_publish.py", "--content", "正文", "--title", "标题",
+        "--images", f"{tmp_path / 'nope.png'}"])
+
+    with pytest.raises(SystemExit) as exc:
+        tp.main()
+
+    assert exc.value.code == 1
+    assert "插图不存在" in capsys.readouterr().err
+
+
+def test_images_flag_parses_existing_files(monkeypatch, tmp_path):
+    """两张图都在 → 两张都进发布流程。"""
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    a.write_bytes(b"x")
+    b.write_bytes(b"x")
+    captured: dict = {}
+
+    def fake_publish(content, title, tags, cover, images, dry_run, headed, as_draft, timeout_ms):
+        captured.update(images=images)
+        return {"platform": "toutiao", "steps": {"title": True, "body": True}}
+
+    monkeypatch.setattr(tp, "publish_article", fake_publish)
+    monkeypatch.setattr(tp, "_write_record", lambda result: tmp_path / "r.json")
+    monkeypatch.setattr(sys, "argv", [
+        "toutiao_publish.py", "--content", "正文", "--title", "标题",
+        "--images", f"{a},{b}"])
+
+    assert tp.main() == 0
+    assert [p.name for p in captured["images"]] == ["a.png", "b.png"], captured["images"]
