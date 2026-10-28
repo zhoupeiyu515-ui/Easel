@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import mimetypes
 import os
 if os.name == "nt":
     import msvcrt
@@ -12,6 +14,7 @@ import ipaddress
 import json
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -21,6 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 import ipaddress
 from pathlib import Path
@@ -29,7 +33,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from sse_starlette.sse import EventSourceResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,15 +45,23 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
 
 from easel.gateway_endpoint import chat_completions_url, healthz_url, port_source
 from easel.openclaw_cmd import openclaw_base_cmd
-from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
+from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
+                           profile_exists, valid_persona_name, _FILE_ORDER)
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
+from easel.manual_publish import build_package, publishing_mode
+from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
+                              history_path, read_settings, stream_chat)
+from easel import harnesses
+from easel.harnesses import store as harness_store
+from easel.harnesses.base import HarnessError, RunRequest
 try:
     from easel.gateway_questions import (
-        GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
+        GatewayClient, GatewayQuestionError, GatewayQuestionClosedError, GatewayUnsupportedError,
         question_bridge_supported)
 except Exception:  # 兼容缺失依赖：问答题桥接降级为关闭
     GatewayClient = None  # type: ignore
     GatewayQuestionError = None  # type: ignore
+    GatewayQuestionClosedError = None  # type: ignore
     GatewayUnsupportedError = None  # type: ignore
     question_bridge_supported = None  # type: ignore
 
@@ -67,6 +79,93 @@ def _qbridge_warn_once(key: str, message: str) -> None:
         return
     _QBRIDGE_WARNED.add(key)
     print(message, file=sys.stderr, flush=True)
+
+
+def _gateway_question_timing(question: dict) -> dict:
+    return {key: value for key in ("createdAtMs", "expiresAtMs")
+            if isinstance(value := question.get(key), (int, float))
+            and not isinstance(value, bool) and 0 <= value <= 9_007_199_254_740_991}
+
+
+def _gateway_question_state(question: dict | None) -> dict:
+    if question is None:
+        return {"status": "not_found"}
+    status = question.get("status")
+    if status not in {"pending", "answered", "resolved", "cancelled", "expired", "closed"}:
+        status = "unknown"
+    return {"status": status, **_gateway_question_timing(question)}
+
+
+def _poll_gateway_questions(sk: str, proc, emit, stop: threading.Event) -> None:
+    global _QBRIDGE_DISABLED
+    if _QBRIDGE_DISABLED or GatewayClient is None:
+        return
+    if question_bridge_supported is not None and not question_bridge_supported():
+        _QBRIDGE_DISABLED = True
+        _qbridge_warn_once(
+            "unsupported", "[question-bridge] 当前 OpenClaw 版本无 question RPC（需 2026.9.x+），"
+            "已跳过 ask_user 选项卡片桥接，改用文字问答。")
+        return
+    client = None
+    pushed: set[str] = set()
+    pending: set[str] = set()
+    final_check = False
+    try:
+        try:
+            client = GatewayClient()
+            client.connect()
+        except Exception:
+            _QBRIDGE_DISABLED = True
+            _qbridge_warn_once(
+                "connect", "[question-bridge] connect gateway failed，已停用桥接（本进程），"
+                "ask_user 改用文字问答。")
+            return
+        while True:
+            try:
+                items = client.list_questions(session_key=f"agent:main:{sk}", status="pending")
+            except GatewayUnsupportedError:
+                _QBRIDGE_DISABLED = True
+                _qbridge_warn_once(
+                    "unsupported", "[question-bridge] 当前 OpenClaw 版本无 question RPC，"
+                    "已停用 ask_user 选项卡片桥接（需 2026.9.x+）。")
+                return
+            except Exception:
+                if proc.poll() is not None or stop.wait(2):
+                    return
+                continue
+            current = {item["id"] for item in items if item.get("id")}
+            for identifier in sorted(pending - current):
+                try:
+                    status = _gateway_question_state(client.get_question(identifier))["status"]
+                except GatewayQuestionClosedError as error:
+                    status = error.status
+                except GatewayUnsupportedError:
+                    status = "closed"
+                except Exception:
+                    current.add(identifier)
+                    continue
+                if status in ("pending", "unknown"):
+                    current.add(identifier)
+                    continue
+                emit("question_closed", json.dumps({"id": identifier, "status": status}))
+            for item in items:
+                identifier = item.get("id")
+                if identifier and identifier not in pushed:
+                    pushed.add(identifier)
+                    emit("question", json.dumps({
+                        "id": identifier, "questions": item.get("questions", []),
+                        "expiresAtMs": None, **_gateway_question_timing(item),
+                    }, ensure_ascii=False))
+            pending = current
+            if proc.poll() is not None or stop.is_set():
+                if pending and not final_check:
+                    final_check = True
+                    continue
+                return
+            stop.wait(2)
+    finally:
+        if client is not None:
+            client.close()
 
 PROFILES_DIR = PROJECT_ROOT / "profiles"
 SKILLS_DIR = PROJECT_ROOT / "skills"
@@ -195,7 +294,7 @@ def _heal_openclaw_session(sk: str) -> None:
 
 SHARED_SCRIPTS = PROJECT_ROOT / "skills" / "shared" / "scripts"
 # 头条发布脚本是自带 SKILL 的专用 publisher（与 xhs/douyin 同款），不在 shared/scripts 下。
-TOUTIAO_SCRIPTS = PROJECT_ROOT / "skills" / "openclaw" / "skill-toutiao-publisher" / "scripts"
+TOUTIAO_SCRIPTS = PROJECT_ROOT / "skills" / "builtin" / "skill-toutiao-publisher" / "scripts"
 if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
@@ -216,6 +315,8 @@ LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 WHOAMI_TTL = 600  # 秒
 _WHOAMI_CACHE: dict[str, tuple[float, dict]] = {}
 _WHOAMI_LOCK = threading.Lock()
+_WHOAMI_TASKS: dict[str, asyncio.Task] = {}
+_LOGIN_START_LOCKS: dict[str, asyncio.Lock] = {}
 
 LOGIN_RUNNERS: dict[str, dict] = {
     "xiaohongshu": {"name": "小红书", "backend": "xhs", "profile": "XiaohongshuProfile"},
@@ -233,7 +334,7 @@ LOGIN_RUNNERS: dict[str, dict] = {
 # ---- 微信公众号（wechat-oa）凭证式接入 ----
 # 复用 skill-wechat-publisher 的发布引擎与配置：凭证存在其 wechat-publisher.yaml，
 # 发布/取数脚本都从这里读账号。web 侧统一用账号 key "web"。
-WECHAT_SKILL_DIR = PROJECT_ROOT / "skills" / "openclaw" / "skill-wechat-publisher"
+WECHAT_SKILL_DIR = PROJECT_ROOT / "skills" / "builtin" / "skill-wechat-publisher"
 WECHAT_SKILL_SCRIPTS = WECHAT_SKILL_DIR / "scripts"
 WECHAT_PUBLISH_SCRIPT = WECHAT_SKILL_SCRIPTS / "publish.py"
 WECHAT_CONFIG_YAML = WECHAT_SKILL_DIR / "wechat-publisher.yaml"
@@ -405,7 +506,9 @@ SKILL_API_REQUIREMENTS: dict[str, dict] = {
     },
 }
 
-_ENV_ALLOWLIST: set[str] = set()
+_ENV_ALLOWLIST: set[str] = {
+    "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_KEY", "EASEL_DIRECT_API_MODEL",
+}
 for _spec in SKILL_API_REQUIREMENTS.values():
     for _key in _spec.get("settings", []):
         _ENV_ALLOWLIST.add(_key["env"])
@@ -416,6 +519,7 @@ for _spec in SKILL_API_REQUIREMENTS.values():
             _ENV_ALLOWLIST.update(_key.get("aliases", []))
 
 ENV_FILE = PROJECT_ROOT / ".env"
+_HARNESS_LOOP = None
 _PLACEHOLDER_RE = re.compile(r"replace_me|your[-_]?api[-_]?key|xxx|^\.{3}$|^<.*>$", re.I)
 
 TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".log", ".py", ".js", ".ts", ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".srt", ".vtt"}
@@ -426,7 +530,17 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
+    global _HARNESS_LOOP
+    _HARNESS_LOOP = asyncio.get_running_loop()
     yield
+    tasks = list(_HARNESS_TASKS)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
+    _HARNESS_LOOP = None
     _stop_mp_login_on_shutdown()
 
 
@@ -522,7 +636,7 @@ def list_personas() -> list[dict]:
         return []
     result = []
     for d in sorted(PROFILES_DIR.iterdir()):
-        if d.is_dir() and d.name.startswith('_'):
+        if not d.is_dir() or not valid_persona_name(d.name):
             continue
         desc = ''
         identity = d / 'identity.md'
@@ -540,7 +654,7 @@ def find_skill(name: str) -> str | None:
     """查找 SKILL，返回完整名或 None。与 CLI skill.py 一致。"""
     cands = [name, f'skill-{name}'] if not name.startswith('skill-') else [name]
     for cand in cands:
-        if (SKILLS_DIR / 'openclaw' / cand / 'SKILL.md').is_file():
+        if (SKILLS_DIR / 'builtin' / cand / 'SKILL.md').is_file():
             return cand
     return None
 
@@ -596,7 +710,7 @@ def _parse_skill_md(path: Path) -> tuple[str, str, str]:
 def get_skills() -> list[dict]:
     env = _read_env()
     result = []
-    sd = SKILLS_DIR / 'openclaw'
+    sd = SKILLS_DIR / 'builtin'
     if sd.is_dir():
         for d in sorted(sd.iterdir()):
             if d.is_dir() and (d / 'SKILL.md').is_file():
@@ -703,6 +817,25 @@ def _mask(val: str) -> str:
     return '••••' + v[-4:]
 
 
+# 要从回显文本里抹掉的 .env 键：命中这些词的一律当机密处理
+_SECRETISH_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|COOKIE', re.I)
+
+
+def _scrub_secrets(text: str) -> str:
+    """把 .env 里的机密值从要回显给前端的文本里抹掉。
+
+    子进程 stderr 会被原样带到浏览器，而 openclaw 的报错可能回显配置值；
+    按「已知机密的字面量」替换最稳妥，不依赖猜正则能否匹配各家 key 的格式。
+    """
+    out = text
+    for key, val in _read_env().items():
+        v = val.strip().strip('"').strip("'")
+        # 太短的值（占位符、枚举值如 none/http）替换会误伤正常文本
+        if len(v) >= 8 and _SECRETISH_RE.search(key):
+            out = out.replace(v, _mask(v))
+    return out
+
+
 def _key_configured(key: dict, env: dict[str, str]) -> bool:
     '某个 key（含别名）是否已配置。'
     if _is_set(env.get(key['env'])):
@@ -756,6 +889,7 @@ def _is_local_gateway_base(url: str) -> bool:
 
 # 设置面板里「改了 Base URL 就必须重填 Key」要比对的 .env 键位（槽位 → (base 键, key 键)）。
 _SLOT_ENV_KEYS = {
+    'direct-api': ('EASEL_DIRECT_API_BASE_URL', 'EASEL_DIRECT_API_KEY'),
     'openai': ('OPENAI_BASE_URL', 'OPENAI_API_KEY'),
     'relay': ('EASEL_LLM_BASE_URL', 'EASEL_LLM_API_KEY'),
     'anthropic': ('ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'),
@@ -790,6 +924,54 @@ def _ssrf_safe(u: str) -> bool:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
+
+
+def _direct_api_enabled() -> bool:
+    return _harness_settings()["runtime"] == "api"
+
+
+def _harness_settings() -> dict:
+    try:
+        return harness_store.settings(OUTPUTS_DIR, read_settings(ENV_FILE))
+    except HarnessError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+def _chat_backend(session_id: str | None) -> str:
+    selected = "api" if _direct_api_enabled() else _harness_settings()["runtime"]
+    if not session_id:
+        return selected
+    try:
+        record = harness_store.binding(SESSIONS_DIR, session_id)
+    except HarnessError as error:
+        raise HTTPException(409, str(error)) from error
+    owner = record.get("runtime")
+    if not owner:
+        if history_path(SESSIONS_DIR, session_id).is_file():
+            owner = "api"
+        elif ((OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(session_id)}.jsonl").is_file()
+              or (OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(f'web:{session_id}')}.jsonl").is_file()
+              or _transport_pin_file(session_id).is_file()
+              or (selected != "api" and _turn_file(f"web:{session_id}").is_file())):
+            owner = "openclaw"
+    if selected == "api" and owner == "openclaw":
+        return selected
+    if owner and owner != selected:
+        raise HTTPException(409, f"此会话属于 {owner}，当前选择 {selected}；请新建会话，原历史不变")
+    return selected
+
+
+def _model_target_allowed(base: str, slot: str = "") -> bool:
+    # Trust only the exact gateway configured by the user, not arbitrary private URLs.
+    settings = read_settings(ENV_FILE)
+    configured = settings.get("EASEL_DIRECT_API_BASE_URL", "").strip().rstrip("/")
+    if slot == "direct-api" and _direct_api_enabled() and base.rstrip("/") == configured:
+        try:
+            api_config(settings, require_model=False)
+            return True
+        except DirectAPIError:
+            return False
+    return _ssrf_safe(base)
 
 
 def _write_env(updates: dict[str, str]) -> None:
@@ -854,21 +1036,86 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
     }
 
 
+def _agent_thinking_level() -> str:
+    try:
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8-sig"))
+        agents = data.get("agents", {})
+        reference = agents.get("defaults", {}).get("model", {})
+        for agent in agents.get("list", []):
+            if isinstance(agent, dict) and agent.get("id") == "main" and agent.get("model"):
+                reference = agent["model"]
+                break
+        primary = reference.get("primary", "") if isinstance(reference, dict) else reference
+        if not isinstance(primary, str) or "/" not in primary:
+            return THINKING_LEVEL
+        provider, model_id = primary.split("/", 1)
+        models = data.get("models", {}).get("providers", {}).get(provider, {}).get("models", [])
+        for model in models:
+            if isinstance(model, dict) and model.get("id") == model_id:
+                return "off" if model.get("reasoning") is False else THINKING_LEVEL
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return THINKING_LEVEL
+
+
+def _publishing_message(message: str) -> str:
+    if publishing_mode(read_settings(ENV_FILE)) == "manual":
+        return ("【当前 Web 发布方式：人工提交】AI 只负责创作、排版、素材和审核建议。"
+                "不要调用发布脚本、发布接口、浏览器代填或代点发布。"
+                "引导用户在发布中心审核、复制或导出，再在官方页面亲自提交。"
+                "导出、复制、打开网页和排期均不代表已发布。\n\n" + message)
+    return message
+
+
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
+    if _direct_api_enabled():
+        raise HTTPException(409, "API 直连模式支持聊天；此操作需要具备文件和技能执行工具的 Agent 运行时")
+    msg = _publishing_message(msg)
     sk = session_id or f'web-{int(time.time() * 1000)}'
-    _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效
+    runtime = _chat_backend(session_id)
+    if runtime not in ("api", "openclaw"):
+        async def execute():
+            request = ChatRequest(message=msg, sessionId=sk)
+            errors = []
+            def emit(kind, text):
+                if kind == "error":
+                    errors.append(text)
+            result = await _run_harness_chat(request, sk, msg, runtime, _harness_settings(), emit,
+                                             timeout, interactive=False)
+            if errors:
+                raise HTTPException(502, errors[0])
+            return result
+        if _HARNESS_LOOP is not None and _HARNESS_LOOP.is_running():
+            return asyncio.run_coroutine_threadsafe(execute(), _HARNESS_LOOP).result(timeout + 15)
+        return asyncio.run(execute())
     # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
     cmd = openclaw_base_cmd() + ['--profile', OPENCLAW_PROFILE, 'agent', '--agent', 'main',
            '--session-key', f'agent:main:{sk}', '--session-id', _openclaw_session_id(sk),
-           '--thinking', THINKING_LEVEL,
+           '--thinking', _agent_thinking_level(),
            '--timeout', str(timeout), '--message', msg]
     # 跨进程锁：同一会话同时刻只跑一个 openclaw，防并发 takeover 崩溃（rc=1）
     xlock = _CrossProcLock(sk)
     if not xlock.acquire(timeout=min(timeout, 300)):
         return '⏳ 这个会话正在另一个窗口运行，请稍候再试'
+    # 同 supervisor：先拿到锁再 heal，避免与正在追加 transcript 的进程并发重写丢行
+    _heal_openclaw_session(sk)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
-        return clean_agent_output(r.stdout or '') or '（无输出）'
+        out = clean_agent_output(r.stdout or '')
+        if out:
+            return out
+        # 以前这里直接 `or '（无输出）'`：returncode 与 stderr 全部丢弃，于是子进程的
+        # 任何失败（参数不被当前 OpenClaw 版本支持、配置校验不过、provider 报错）都长
+        # 成同一句「（无输出）」，排查只能靠手动把整条命令行复现一遍。
+        # 实测 `--session-key` 在老版 OpenClaw 上不存在，就是被这里藏掉一整轮的。
+        err = clean_agent_output(r.stderr or '')
+        if r.returncode != 0:
+            detail = _scrub_secrets(err)[-400:].strip() or f'退出码 {r.returncode}'
+            return f'❌ agent 执行失败（rc={r.returncode}）：{detail}'
+        # rc=0 但没有任何产出：stderr 里通常有线索（如模型拒答、工具被拦）
+        if err:
+            return f'（无输出）\n\n{_scrub_secrets(err)[-400:].strip()}'
+        return '（无输出）'
     except subprocess.TimeoutExpired:
         return '⏱️ 请求超时'
     except Exception as e:
@@ -881,7 +1128,9 @@ def check_gateway() -> bool:
     try:
         # 端口不能写死：Easel 用 --profile easel，OpenClaw 对非默认 profile 会走
         # 20000 + fnv1a32(profile) % 40000（easel → 37289），见 easel/gateway_endpoint.py。
-        with urllib.request.urlopen(healthz_url(), timeout=3) as response:
+        # 回环 healthz 探针不能继承 http_proxy；否则设置页会把健康的本机 gateway 误报离线。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(healthz_url(), timeout=3) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -1037,7 +1286,114 @@ async def static_file(path: str):
 
 @app.get("/api/status")
 async def api_status():
-    return {"gateway": check_gateway(), "skills": get_skills(), "personas": list_personas()}
+    direct = _direct_api_enabled()
+    runtime = _harness_settings()["runtime"]
+    ready = False
+    if direct:
+        try:
+            api_config(read_settings(ENV_FILE))
+            ready = True
+        except DirectAPIError:
+            pass
+    elif runtime == "openclaw":
+        ready = await asyncio.to_thread(check_gateway)
+    else:
+        ready = harnesses.describe(runtime)["installed"]
+    return {"gateway": ready, "transport": "api" if direct else (
+                CHAT_TRANSPORT if runtime == "openclaw" else runtime), "runtime": runtime,
+            "skills": get_skills(), "personas": list_personas()}
+
+
+@app.get("/api/settings/bootstrap")
+async def api_settings_bootstrap():
+    """首次打开时的自检：模型配好了吗、网关活着吗、上次安装留了什么没做完。
+
+    安装脚本不再在终端问 API Key（改为引导到这里配），所以前端需要一个可靠的
+    「还缺什么」判据。modelConfigured 必须同时满足两件事，这正是 doctor 里那条
+    「全绿却对话报错」防线：
+      - .env 里有可用的认证（_env_key_valid，带占位符识别）；
+      - primary 指向的 provider 在 openclaw.json 里真的配了认证
+        （_primary_model_routable）—— 只查 .env 查不出 provider 一个字没写的情况。
+    """
+    direct = _direct_api_enabled()
+    runtime = _harness_settings()["runtime"]
+    if runtime not in ("api", "openclaw"):
+        installed = harnesses.describe(runtime)["installed"]
+        return {"modelConfigured": installed, "envKeyOk": installed, "routeOk": installed,
+                "routeDetail": "CLI 已安装；请在终端完成原生登录，并发送消息验证模型可用性",
+                "gatewayUp": installed, "openclawConfigExists": False, "installWarnings": [],
+                "runtime": runtime, "authVerified": False}
+    env_ok = False
+    route_ok = False
+    route_detail = ''
+    try:
+        if direct:
+            api_config(read_settings(ENV_FILE))
+            env_ok = route_ok = True
+        else:
+            from easel.commands.doctor import _env_key_valid, _primary_model_routable
+            env_ok = bool(_env_key_valid())
+            route_ok, route_detail = _primary_model_routable()
+    except DirectAPIError as error:
+        route_detail = str(error)
+    except Exception as e:  # noqa: BLE001
+        route_detail = f'自检失败：{e}'
+
+    warnings: list[dict] = []
+    try:
+        rep = PROJECT_ROOT / 'outputs' / '_install' / 'last-install.json'
+        if rep.is_file():
+            warnings = json.loads(rep.read_text(encoding='utf-8')).get('warnings') or []
+    except Exception:  # noqa: BLE001
+        warnings = []
+
+    return {
+        'modelConfigured': bool(env_ok and route_ok),
+        'envKeyOk': env_ok,
+        'routeOk': bool(route_ok),
+        'routeDetail': route_detail,
+        'gatewayUp': bool(route_ok) if direct else bool(await asyncio.to_thread(check_gateway)),
+        'openclawConfigExists': _oc_config_path().is_file(),
+        'installWarnings': warnings,
+    }
+
+
+@app.post("/api/gateway/restart")
+async def api_gateway_restart():
+    """重启本机 gateway，让刚保存的模型配置立刻生效。
+
+    为什么需要：默认传输层是 http（见 CHAT_TRANSPORT），对话走的是一个常驻 gateway，
+    由 setup.sh 启动一次。配置改了之后它是否重新读 openclaw.json 取决于 OpenClaw 版本，
+    不是一条该押在安装流程上的假设。
+
+    安全性：web/app.py 绑 0.0.0.0 且无鉴权，所以这个端点刻意做成**无参数**，argv
+    完全固定（复用 easel.commands.gateway 的同一条分发），不接受任何外部输入拼进命令。
+    """
+    if _direct_api_enabled():
+        return {'ok': True, 'note': 'API 直连配置下一轮生效，无需重启 OpenClaw'}
+    if _harness_settings()["runtime"] != "openclaw":
+        raise HTTPException(409, "当前 Agent 使用独立按轮启动的进程，不需要重启 OpenClaw 网关")
+    script = PROJECT_ROOT / 'scripts' / ('gateway.ps1' if os.name == 'nt' else 'gateway.sh')
+    if not script.is_file():
+        raise HTTPException(500, '找不到 gateway 启动脚本')
+    cmd = (['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script), 'restart']
+           if os.name == 'nt' else ['bash', str(script), 'restart'])
+    try:
+        r = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True,
+                                   text=True, timeout=120, env=_proxy_env()),
+        )
+    except subprocess.TimeoutExpired:
+        # 超时返回提示而不是 500：网关可能只是起得慢，用户刷新一下就好。
+        return {'ok': False, 'note': '重启超时；可稍后刷新，或手动运行 bash scripts/gateway.sh restart'}
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'note': f'重启失败：{e}'}
+    # check_gateway 里有阻塞的 urllib 探针（最多 3s）：丢线程，别卡事件循环
+    up = await asyncio.to_thread(check_gateway)
+    tail = clean_agent_output(r.stdout or '')[-200:]
+    return {'ok': bool(up), 'gatewayUp': bool(up),
+            'note': tail or ('网关已重启' if up else '网关未就绪，请查看 /tmp/easel-gateway.log')}
 
 
 @app.get("/api/personas")
@@ -1054,7 +1410,7 @@ async def api_persona(name: str):
 
 
 def _valid_persona_name(name: str) -> bool:
-    return bool(name) and "/" not in name and "\\" not in name and not name.startswith((".", "_"))
+    return valid_persona_name(name)
 
 
 def _persona_file_path(name: str, filename: str) -> Path:
@@ -1125,7 +1481,7 @@ async def api_skill_detail(name: str):
     full = find_skill(name)
     if full is None:
         raise HTTPException(404, f"SKILL '{name}' 不存在")
-    desc, layer, body = _parse_skill_md(SKILLS_DIR / "openclaw" / full / "SKILL.md")
+    desc, layer, body = _parse_skill_md(SKILLS_DIR / "builtin" / full / "SKILL.md")
     needs_api = full in SKILL_API_REQUIREMENTS
     env = _read_env()
     return {
@@ -1289,66 +1645,113 @@ def _mask_key(v: str) -> str:
     return f"«{v[:5]}…{v[-4:]}»" if len(v) > 14 else "«已配置»"
 
 
-def _model_channels() -> dict:
+def _model_channels(runtime: str | None = None) -> dict:
     env = _read_env()
     primary = ""
+    direct = runtime == "api" if runtime else _direct_api_enabled()
     try:
         oc = _oc_config_path()
-        if oc.is_file():
-            primary = str(json.loads(oc.read_text(encoding="utf-8"))
+        if not direct and oc.is_file():
+            primary = str(json.loads(oc.read_text(encoding="utf-8-sig"))
                           .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
     except Exception:  # noqa: BLE001
         pass
+    if direct:
+        env = read_settings(ENV_FILE)
+        primary = f"direct-api/{env.get('EASEL_DIRECT_API_MODEL', '')}"
+    direct_ready = False
+    if direct:
+        try:
+            api_config(env)
+            direct_ready = True
+        except DirectAPIError:
+            pass
 
     chat_rows = []
     ob = (env.get("OPENAI_BASE_URL") or "").strip()
     om = (env.get("OPENAI_MODEL") or "").strip()
-    ok_key = bool((env.get("OPENAI_API_KEY") or "").strip())
-    if ob or ok_key:
+    ok_key = _is_set(env.get("OPENAI_API_KEY"))
+    if direct:
+        chat_rows.append({
+            "slot": "direct-api", "order": 1, "name": "本地 / 内网 API 直连",
+            "sub": "独立直连配置", "type": "openai",
+            "model": env.get("EASEL_DIRECT_API_MODEL", "").strip(),
+            "baseUrl": env.get("EASEL_DIRECT_API_BASE_URL", "").strip(),
+            "keyMasked": _mask_key(env.get("EASEL_DIRECT_API_KEY", "")),
+            "role": "主", "result": "已配置" if direct_ready else "缺配置",
+        })
+    elif ob or ok_key:
         chat_rows.append({
             "slot": "openai", "order": 1, "name": "deepseek",
             "sub": "官方直连",
             "type": "openai", "model": om or "deepseek-chat",
-            "baseUrl": ob, "keyMasked": _mask_key(env.get("OPENAI_API_KEY", "")),
+            "baseUrl": ob, "keyMasked": _mask_key(env.get("OPENAI_API_KEY", "") if ok_key else ""),
             "role": "主" if primary.startswith("openai/") else "备",
             "result": "已配置" if ok_key else "缺 key",
         })
+    def _is_primary(pkey: str, model: str) -> bool:
+        """这一行是不是当前的主模型。
+
+        不能像 openai 行那样只比 provider 前缀：anthropic 与 relay 两个槽位现在都落在
+        同一个 anthropic provider 上（见 _sync_anthropic_provider），只比前缀会让两行
+        同时显示「主」。所以连模型一起比；model 本身可能已是 provider/model 形式
+        （CLAUDE_MODEL 按约定就这么写），两种写法都要认。
+        """
+        if not primary or not model:
+            return False
+        return primary == model or primary == f"{pkey}/{model}"
+
     ab = (env.get("ANTHROPIC_BASE_URL") or "").strip()
     ak = (env.get("ANTHROPIC_API_KEY") or "").strip()
-    if ab or ak:
+    ak_ok = _is_set(ak)
+    if not direct and (ab or ak):
         chat_rows.append({
             "slot": "anthropic", "order": len(chat_rows) + 1, "name": "anthropic", "sub": "官方直连",
             "type": "anthropic", "model": (env.get("CLAUDE_MODEL") or "claude-sonnet-4-6").strip(),
-            "baseUrl": ab or "官方", "keyMasked": _mask_key(ak),
-            "role": "备", "result": "已配置" if ak else "缺 key",
+            "baseUrl": ab or "官方", "keyMasked": _mask_key(ak if ak_ok else ""),
+            # 原来写死「备」：主模型明明是 anthropic/... 时面板也显示备用，和 openai 行
+            # 的处理不一致，用户据此判断「哪个在生效」会判错。
+            "role": "主" if _is_primary("anthropic", (env.get("CLAUDE_MODEL") or "").strip()) else "备",
+            "result": "已配置" if ak_ok else "缺 key",
         })
     lb = (env.get("EASEL_LLM_BASE_URL") or "").strip()
     lk = (env.get("EASEL_LLM_API_KEY") or "").strip()
-    if lb or lk:
+    lk_ok = _is_set(lk)
+    if not direct and (lb or lk):
         chat_rows.append({
             "slot": "relay", "order": len(chat_rows) + 1, "name": "relay", "sub": "中转站",
             "type": "openai", "model": (env.get("CLAUDE_MODEL") or "deepseek-chat").strip(),
-            "baseUrl": lb or "（未配置）", "keyMasked": _mask_key(lk),
-            "role": "备", "result": "已配置" if lk else "缺 key",
+            "baseUrl": lb or "（未配置）", "keyMasked": _mask_key(lk if lk_ok else ""),
+            # relay 槽位落的也是 anthropic provider（与 setup.sh 的 EASEL_LLM_* 分支一致）
+            "role": "主" if _is_primary("anthropic", (env.get("CLAUDE_MODEL") or "").strip()) else "备",
+            "result": "已配置" if lk_ok else "缺 key",
         })
 
     custom_rows = []
     try:
         oc = _oc_config_path()
-        if oc.is_file():
-            provs = (json.loads(oc.read_text(encoding="utf-8"))
+        if not direct and oc.is_file():
+            provs = (json.loads(oc.read_text(encoding="utf-8-sig"))
                      .get("models", {}).get("providers", {})) or {}
             for pkey, pv in provs.items():
                 if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
                     continue
                 models = pv.get("models") if isinstance(pv.get("models"), list) else []
                 mid = models[0].get("id", "") if models and isinstance(models[0], dict) else ""
+                model_entry = models[0] if models and isinstance(models[0], dict) else {}
+                compat = model_entry.get("compat")
+                compat = compat if isinstance(compat, dict) else {}
                 custom_rows.append({
                     "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
-                    "type": "openai", "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
-                    "keyMasked": _mask_key(str(pv.get("apiKey") or "")),
+                    "type": "openai",
+                    "protocol": "anthropic" if pv.get("api") == "anthropic-messages" else "openai",
+                    "thinking": model_entry.get("reasoning") is True,
+                    "thinkingFormat": compat.get("thinkingFormat", ""),
+                    "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
+                    "keyMasked": _mask_key(str(pv.get("apiKey") or "")
+                                           if _is_set(str(pv.get("apiKey") or "")) else ""),
                     "role": "主" if primary == f"{pkey}/{mid}" else "备",
-                    "result": "已配置" if str(pv.get("apiKey") or "").strip() else "缺 key",
+                    "result": "已配置" if _is_set(str(pv.get("apiKey") or "")) else "缺 key",
                     "deletable": True,
                 })
     except Exception:  # noqa: BLE001
@@ -1406,13 +1809,103 @@ def _model_channels() -> dict:
             channels[_ch] = {"rows": _rows}
     except Exception:  # noqa: BLE001
         pass
-    return {"channels": channels, "primary": primary}
+    return {"channels": channels, "primary": primary,
+            "transport": "api" if direct else "openclaw"}
+
+
+class ChatTransportRequest(BaseModel):
+    transport: str
+
+
+class HarnessSettingsRequest(BaseModel):
+    runtime: str
+    model: str = Field(default="", max_length=240)
+    sandbox: str = "workspace-write"
+    codex_auto_approve: StrictBool | None = None
+
+
+@app.get("/api/settings/harness")
+async def api_harness_settings():
+    config = _harness_settings()
+    agents = await asyncio.to_thread(lambda: [harnesses.describe(runtime) for runtime in harness_store.IDS])
+    return {**config, "agents": agents,
+            "locked": "EASEL_AGENT_RUNTIME" in read_settings(ENV_FILE)}
+
+
+@app.post("/api/settings/harness")
+async def api_harness_settings_save(req: HarnessSettingsRequest):
+    if req.runtime not in harness_store.IDS:
+        raise HTTPException(400, "未知 Agent 底座")
+    if req.sandbox not in ("read-only", "workspace-write"):
+        raise HTTPException(400, "请选择只读或工作区写入权限")
+    if any(ord(character) < 32 for character in req.model):
+        raise HTTPException(400, "模型名称不能包含控制字符")
+    if "EASEL_AGENT_RUNTIME" in read_settings(ENV_FILE):
+        raise HTTPException(409, "启动环境固定了底座，请修改 EASEL_AGENT_RUNTIME 后重启")
+    if _RUNNING_CHAT or _BG_TASKS or _DIRECT_CHAT_TASKS or _HARNESS_TASKS:
+        raise HTTPException(409, "请等待当前任务完成或停止后切换底座")
+    if req.runtime not in ("api", "openclaw") and not harnesses.describe(req.runtime)["installed"]:
+        raise HTTPException(409, "请先在终端安装并配置对应 Agent CLI，再切换")
+    config = _harness_settings()
+    if req.runtime == "openclaw" and api_mode(read_settings(ENV_FILE)):
+        if "EASEL_CHAT_TRANSPORT" in os.environ:
+            raise HTTPException(409, "运行环境已固定仅聊天模式，请修改 EASEL_CHAT_TRANSPORT 后重启")
+        _write_env_direct({"EASEL_CHAT_TRANSPORT": "http"})
+    config["runtime"] = req.runtime
+    config["sandbox"] = req.sandbox
+    if req.runtime == "codex" and req.codex_auto_approve is not None:
+        config["codex_auto_approve"] = req.codex_auto_approve
+    config["models"] = {**config["models"], req.runtime: req.model.strip()}
+    harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
+    return await api_harness_settings()
+
+
+@app.post("/api/settings/chat/transport")
+async def api_chat_transport_save(req: ChatTransportRequest):
+    if req.transport not in ("api", "openclaw"):
+        raise HTTPException(400, "请选择 api 或 openclaw")
+    if "EASEL_AGENT_RUNTIME" in read_settings(ENV_FILE):
+        raise HTTPException(409, "启动环境固定了执行引擎，请修改 EASEL_AGENT_RUNTIME 后重启")
+    if "EASEL_CHAT_TRANSPORT" in os.environ:
+        raise HTTPException(409, "运行环境已指定 EASEL_CHAT_TRANSPORT，请修改启动环境后重启")
+    if _RUNNING_CHAT or _BG_TASKS or _DIRECT_CHAT_TASKS or _HARNESS_TASKS:
+        raise HTTPException(409, "请等待当前对话完成或停止后切换模式")
+    config = _harness_settings()
+    _write_env_direct({"EASEL_CHAT_TRANSPORT": "api" if req.transport == "api" else "http"})
+    config["runtime"] = "api" if req.transport == "api" else "openclaw"
+    harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
+    return _model_channels()
 
 
 @app.get("/api/settings/models")
-async def api_settings_models():
+async def api_settings_models(runtime: str | None = None):
     """模型通道：chat / transcribe（含可编辑的原值；key 只回脱敏）。"""
-    return _model_channels()
+    if runtime is not None and runtime not in ("api", "openclaw"):
+        raise HTTPException(400, "仅聊天和 OpenClaw 才有 API 供应商配置")
+    if runtime is None:
+        return await asyncio.to_thread(_model_channels)
+    return await asyncio.to_thread(_model_channels, runtime)
+
+
+@app.post("/api/settings/harness/models/{runtime}")
+async def api_harness_models(runtime: str):
+    if runtime not in ("codex", "opencode"):
+        raise HTTPException(400, "此底座不支持原生模型列表")
+    from easel.harnesses.base import RunRequest
+    from easel.harnesses.models import available_models
+    request = RunRequest("", PROJECT_ROOT, {
+        **_proxy_env(), "EASEL_ROOT": str(PROJECT_ROOT), "EASEL_AGENT_RUNTIME": runtime})
+    try:
+        models = await asyncio.wait_for(available_models(runtime, request), 25)
+    except asyncio.TimeoutError as error:
+        raise HTTPException(504, "原生模型列表读取超时，请稍后重试") from error
+    except (HarnessError, OSError, UnicodeError) as error:
+        raise HTTPException(409, "无法读取原生模型列表，请检查 CLI 安装与原生配置") from error
+    return {"runtime": runtime, "models": models}
 
 
 def _write_env_direct(updates: dict[str, str]) -> None:
@@ -1448,13 +1941,19 @@ def _write_env_direct(updates: dict[str, str]) -> None:
 
 
 RESERVED_PROVIDER_KEYS = {"openai", "anthropic", "relay"}
+THINKING_FORMATS = {
+    "openai", "openrouter", "deepseek", "together", "qwen", "qwen-chat-template", "zai",
+}
+THINKING_COMPAT_KEYS = {
+    "thinkingFormat", "supportsReasoningEffort", "supportedReasoningEfforts", "reasoningEffortMap",
+}
 
 
 def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
     """读 openclaw.json 里每个 chat 供应商现存的 (baseUrl, apiKey)。读不到就当空表（不阻断保存）。"""
     try:
         oc = _oc_config_path()
-        provs = json.loads(oc.read_text(encoding='utf-8')).get('models', {}).get('providers', {})
+        provs = json.loads(oc.read_text(encoding='utf-8-sig')).get('models', {}).get('providers', {})
         return {k: (str(v.get('baseUrl') or ''), str(v.get('apiKey') or ''))
                 for k, v in provs.items() if isinstance(v, dict)}
     except Exception:  # noqa: BLE001
@@ -1471,7 +1970,7 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         changed = False
         for pkey in [k for k in list(providers.keys())
@@ -1481,6 +1980,15 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         for pkey, vals in provider_updates.items():
             prov = providers.setdefault(pkey, {})
             base, key, model = vals.get('base', ''), vals.get('key', ''), vals.get('model', '')
+            # 协议只在用户显式选择时落盘：anthropic → api=anthropic-messages；
+            # openai/空 → 不写 api 字段（openclaw 默认 openai-completions，与既有配置零差异）。
+            proto = (vals.get('protocol') or '').strip().lower()
+            if proto == 'anthropic' and prov.get('api') != 'anthropic-messages':
+                prov['api'] = 'anthropic-messages'
+                changed = True
+            elif proto == 'openai' and prov.get('api') == 'anthropic-messages':
+                prov.pop('api', None)
+                changed = True
             if base and prov.get('baseUrl') != base:
                 if _is_local_gateway_base(prov.get('baseUrl')):
                     pass  # 本地模型网关模式：保留网关地址（真实上游在 easel-models.yaml），勿改回直连
@@ -1494,10 +2002,36 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
                 models = prov.get('models') if isinstance(prov.get('models'), list) and prov.get('models') else [{}]
                 if not isinstance(models[0], dict):
                     models = [{}]
-                if models[0].get('id') != model:
+                old_model = models[0].get('id')
+                if old_model != model:
                     models[0]['id'] = model
                     changed = True
+                model_name = models[0].get('name')
+                if (not isinstance(model_name, str) or not model_name.strip()
+                        or (model_name == old_model and old_model != model)):
+                    models[0]['name'] = model
+                    changed = True
                 prov['models'] = models
+                thinking = vals.get('thinking')
+                if thinking is not None:
+                    before = json.dumps(models[0], sort_keys=True)
+                    models[0]['reasoning'] = thinking
+                    compat = models[0].get('compat')
+                    compat = dict(compat) if isinstance(compat, dict) else {}
+                    if thinking and prov.get('api') != 'anthropic-messages':
+                        compat.setdefault('supportsReasoningEffort', True)
+                        if vals.get('thinkingFormat'):
+                            compat['thinkingFormat'] = vals['thinkingFormat']
+                        models[0]['compat'] = compat
+                    elif not thinking:
+                        for compat_key in THINKING_COMPAT_KEYS:
+                            compat.pop(compat_key, None)
+                        if compat:
+                            models[0]['compat'] = compat
+                        else:
+                            models[0].pop('compat', None)
+                    if json.dumps(models[0], sort_keys=True) != before:
+                        changed = True
         if primary_ref:
             ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
             if ref.get('primary') != primary_ref:
@@ -1527,18 +2061,38 @@ def _sync_anthropic_provider(base: str, key: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         target_base = base or 'https://api.anthropic.com'
+        # 早退判据必须把 api 一起算上：否则一个「baseUrl/apiKey 都对、但缺 api」的
+        # 残缺 provider（旧版本 Web 面板写出来的就是这样）永远修不回来。
         if isinstance(prov, dict) and prov.get('baseUrl') == target_base \
+                and prov.get('api') == 'anthropic-messages' \
                 and (not key or prov.get('apiKey') == key):
             return ''
         new_prov = dict(prov) if isinstance(prov, dict) else {'models': []}
         new_prov['baseUrl'] = target_base
+        # api 必须显式写死。上面的 docstring 一直这么说，但代码此前漏了这一行 ——
+        # 不写时 OpenClaw 2026.2.x 会把该 provider 当成 openai-responses、请求打到
+        # /responses，上游的报错被 gateway 当成正常回复塞进 choices[0].message.content，
+        # 于是 Web 对话静默显示「（无输出）」。与 setup.sh 的 oc_write_anthropic 对齐。
+        new_prov['api'] = 'anthropic-messages'
+        # setup.sh 同样会设这个；两边都写，provider 才不会因为「谁后写」而缺字段。
+        new_prov.setdefault('timeoutSeconds', 600)
         if key:
             new_prov['apiKey'] = key
         new_prov.setdefault('models', [])
+        # 一次性迁移：更早的 Web 面板会把中转站写成一个名叫 relay 的 provider，但从来
+        # 不给它填内容，primary 却指过去。本次若没拿到 key，就把 relay 里的捡回来，
+        # 免得老用户升级后 key 变成孤儿；迁移后删掉 relay，避免两处并存各写一半。
+        legacy = providers.get('relay')
+        if isinstance(legacy, dict):
+            if not key and not base and not _is_set(new_prov.get('apiKey')) \
+                    and _is_set(legacy.get('apiKey')) and legacy.get('baseUrl'):
+                new_prov['apiKey'] = legacy['apiKey']
+                new_prov['baseUrl'] = legacy['baseUrl']
+            providers.pop('relay', None)
         providers['anthropic'] = new_prov
         shutil.copy2(oc, oc.parent / (oc.name + '.bak-web'))
         tmp = oc.parent / (oc.name + '.tmp')
@@ -1557,6 +2111,11 @@ class ModelSaveRow(BaseModel):
     key: str = ""
     key2: str = ""
     primary: bool = False
+    # 自定义供应商的上游协议：openai（默认，/chat/completions）或 anthropic
+    # （原生 /v1/messages；中转站卖原生 Claude 格式时选它）。
+    protocol: str = ""
+    thinking: StrictBool | None = None
+    thinkingFormat: str | None = None
 
 
 class ModelSaveRequest(BaseModel):
@@ -1568,6 +2127,17 @@ class ModelSaveRequest(BaseModel):
 async def api_settings_models_save(req: ModelSaveRequest):
     """保存模型通道：.env 就地更新（key 留空=不改）；chat 同步 openclaw；媒体通道写 provider 配置。"""
     ch0 = (req.channel or "").strip()
+    if ch0 == "chat" and _harness_settings()["runtime"] not in ("api", "openclaw"):
+        raise HTTPException(409, "当前底座使用原生认证；模型覆盖请在 Agent 底座设置中保存")
+    direct = _direct_api_enabled()
+    if direct and ch0 == "chat" and any(row.slot != "direct-api" for row in req.rows):
+        raise HTTPException(400, "API 直连模式请使用独立的 API 直连通道")
+    if any(row.slot == "direct-api" for row in req.rows) and not (direct and ch0 == "chat"):
+        raise HTTPException(400, "请先切换到 API 直连模式再保存直连配置")
+    if direct and ch0 == "chat" and any(
+            name in os.environ for name in (
+                "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_MODEL", "EASEL_DIRECT_API_KEY")):
+        raise HTTPException(409, "运行环境已指定直连配置，请修改启动环境后重启")
     if ch0 in ("speech", "image", "video", "music"):
         import model_registry as _mr2
         _gid0 = {"speech": "voice", "image": "image", "video": "video", "music": "music"}[ch0]
@@ -1623,8 +2193,8 @@ async def api_settings_models_save(req: ModelSaveRequest):
     keep_custom: set[str] = set()
     primary_ref = ''
     is_chat = (req.channel or '').strip() == 'chat'
-    _cur_env = _read_env()
-    _cur_prov = _openclaw_provider_creds() if is_chat else {}
+    _cur_env = read_settings(ENV_FILE) if direct else _read_env()
+    _cur_prov = _openclaw_provider_creds() if is_chat and not direct else {}
     for row in req.rows:
         slot = (row.slot or '').strip()
         name = (row.name or '').strip().lower()
@@ -1644,7 +2214,14 @@ async def api_settings_models_save(req: ModelSaveRequest):
                 and (_cur_env.get(_ke, '') or '').strip():
             raise HTTPException(400, f'更换 Base URL 时必须重新填写 API Key（{slot}）')
         pkey = ''
-        if slot == 'openai':
+        if slot == 'direct-api':
+            if model:
+                updates['EASEL_DIRECT_API_MODEL'] = model
+            if base:
+                updates['EASEL_DIRECT_API_BASE_URL'] = base
+            if key:
+                updates['EASEL_DIRECT_API_KEY'] = key
+        elif slot == 'openai':
             if model:
                 updates['OPENAI_MODEL'] = model
             if base:
@@ -1662,7 +2239,12 @@ async def api_settings_models_save(req: ModelSaveRequest):
             if key:
                 updates['EASEL_LLM_API_KEY'] = key
             if is_chat:
-                pkey = 'relay'
+                # 落进 anthropic provider，而不是造一个名叫 relay 的 provider。
+                # setup.sh 的 EASEL_LLM_* 分支写的就是 models.providers.anthropic
+                # （见 oc_write_anthropic）。此前这里只写 .env、从不创建 provider，
+                # 却把 primary 指向 relay/<model> —— 对话直接报
+                # 「No route-compatible authentication source is configured for relay」。
+                pkey = 'anthropic'
         elif slot == 'anthropic':
             if model:
                 updates['CLAUDE_MODEL'] = model
@@ -1684,7 +2266,21 @@ async def api_settings_models_save(req: ModelSaveRequest):
                 raise HTTPException(400, f'「{name}」是内置槽位名，请换一个')
             if not model or not base:
                 raise HTTPException(400, f'自定义供应商「{name}」需要同时填模型和 Base URL')
-            provider_updates[name] = {'model': model, 'base': base, 'key': key}
+            proto = (getattr(row, 'protocol', '') or '').strip().lower()
+            if proto not in ('', 'openai', 'anthropic'):
+                raise HTTPException(400, f'协议只支持 openai / anthropic：{proto}')
+            thinking_format = (row.thinkingFormat or '').strip().lower()
+            if thinking_format and thinking_format not in THINKING_FORMATS:
+                raise HTTPException(400, f'不支持的思考格式：{thinking_format}')
+            if thinking_format and row.thinking is None:
+                raise HTTPException(400, '选择思考格式时需要显式声明是否启用思考')
+            if proto == 'anthropic' and thinking_format:
+                raise HTTPException(400, 'Anthropic 原生协议无需选择 OpenAI 兼容思考格式')
+            provider_updates[name] = {'model': model, 'base': base, 'key': key, 'protocol': proto}
+            if row.thinking is not None:
+                provider_updates[name]['thinking'] = row.thinking
+                if thinking_format:
+                    provider_updates[name]['thinkingFormat'] = thinking_format
             keep_custom.add(name)
             pkey = name
         # 同一条规矩也得覆盖 openclaw.json 这一侧：_sync_openclaw_chat 只在 key 非空时改
@@ -1694,23 +2290,74 @@ async def api_settings_models_save(req: ModelSaveRequest):
         # 这道闸会把网关用户彻底锁死（连只改模型都保存不了）；而且下面 _sync_openclaw_chat
         # 本来就不会改网关的 baseUrl，没有「拿旧 Key 打新地址」这个风险。
         if is_chat and pkey and base and not key:
-            _pb, _pk = _cur_prov.get(pkey, ('', ''))
-            if _pk and base != _pb.strip().rstrip('/') and not _is_local_gateway_base(_pb):
+            # 换址校验的「现值」要跟配置的权威来源比：openai/relay/anthropic 的权威在 .env
+            # （面板与 setup.sh 都写它），openclaw.json 只是保存时的镜像——setup.sh 配置后
+            # 用户从没用面板保存过的话，镜像可能停在初始值（如 api.openai.com），拿它比对
+            # 会把「原样回传真值」误判成「换址没填 key」，整个面板都保存不了（真机踩中）。
+            # custom 供应商权威就在 openclaw.json，维持原比对。
+            _be, _ke = _SLOT_ENV_KEYS.get(slot, ('', ''))
+            if _be and _is_set(_cur_env.get(_ke)):
+                _pb = (_cur_env.get(_be, '') or '').strip().rstrip('/')
+                _pk = (_cur_env.get(_ke, '') or '').strip()
+                if slot == 'anthropic' and not _pb:
+                    _pb = 'https://api.anthropic.com'
+            else:
+                _pb, _pk = _cur_prov.get(pkey, ('', ''))
+                _pb = _pb.strip().rstrip('/')
+            if _pk and base != _pb and not _is_local_gateway_base(_pb):
                 raise HTTPException(400, f'更换 Base URL 时必须重新填写 API Key（{pkey}）')
+        if is_chat and slot == 'openai' and not key and _is_set(_cur_env.get('OPENAI_API_KEY')) \
+                and (_cur_env.get('OPENAI_BASE_URL') or '').strip() \
+                and not _is_local_gateway_base(_cur_prov.get('openai', ('', ''))[0]):
+            provider_updates['openai']['key'] = _cur_env['OPENAI_API_KEY'].strip()
+            provider_updates['openai']['base'] = (
+                base or _cur_env['OPENAI_BASE_URL'].strip().rstrip('/'))
         if is_chat and pkey and getattr(row, 'primary', False) and model:
-            primary_ref = f'{pkey}/{model}'
+            # model 可能本来就是 provider/model 形式：anthropic 行的 model 直接取自
+            # .env 的 CLAUDE_MODEL，而那个值按约定就写成 anthropic/claude-opus-4-7。
+            # 无脑拼前缀会写出 anthropic/anthropic/claude-opus-4-7，主模型随即不可路由。
+            # 自定义供应商的模型 ID 是上游原值，可能包含命名空间
+            # （如 LiteLLM 的 dashscope/qwen-*），必须保留并加上实际供应商。
+            primary_ref = (f'{pkey}/{model}' if slot == 'custom'
+                           else model if model.startswith(f'{pkey}/') else f'{pkey}/{model}')
     if not updates and not provider_updates and not primary_ref:
         raise HTTPException(400, '没有可保存的改动（key 留空表示不改）')
+    if is_chat and direct:
+        try:
+            api_config({**_cur_env, **updates})
+        except DirectAPIError as error:
+            raise HTTPException(400, str(error)) from None
     if updates:
         _write_env_direct(updates)
     note = ''
-    if is_chat:
+    if is_chat and direct:
+        note = "API 直连配置已保存，下一轮生效；无需同步 OpenClaw"
+    elif is_chat:
         note = _sync_openclaw_chat(provider_updates, keep_custom, primary_ref)
-        # anthropic 槽位不在 provider_updates 里（它不是自定义供应商），但同样要
-        # 落到 openclaw.json 才真正生效 —— setup.sh 写的 provider 可能已过时。
-        if any((r.slot or '').strip() == 'anthropic' for r in req.rows):
-            _an = _sync_anthropic_provider(updates.get('ANTHROPIC_BASE_URL', ''),
-                                          updates.get('ANTHROPIC_API_KEY', ''))
+        # anthropic / relay 两个槽位都不在 provider_updates 里（它们不是自定义供应商），
+        # 但同样要落到 openclaw.json 才真正生效 —— setup.sh 写的 provider 可能已过时。
+        # 两者共用同一个 anthropic provider，和 setup.sh 的映射保持一致。
+        _slots = {(r.slot or '').strip() for r in req.rows}
+        effective_env = {**_cur_env, **updates}
+        sync_slot = ''
+        for candidate in ('relay', 'anthropic'):
+            base_var, key_var = _SLOT_ENV_KEYS[candidate]
+            if candidate in _slots and _is_set(effective_env.get(key_var)) \
+                    and (candidate == 'anthropic' or effective_env.get(base_var, '').strip()):
+                sync_slot = candidate
+                break
+        if not sync_slot:
+            sync_slot = next((candidate for candidate in ('relay', 'anthropic')
+                              if candidate in _slots), '')
+        if sync_slot:
+            base_var, key_var = _SLOT_ENV_KEYS[sync_slot]
+            if _is_set(effective_env.get(key_var)):
+                sync_base = effective_env.get(base_var, '').strip().rstrip('/')
+                sync_key = effective_env[key_var].strip()
+            else:
+                sync_base = _cur_prov.get('anthropic', ('', ''))[0]
+                sync_key = ''
+            _an = _sync_anthropic_provider(sync_base, sync_key)
             if _an:
                 note = f'{note}；{_an}' if note else _an
     resp = {"ok": True, "note": note}
@@ -1733,7 +2380,7 @@ async def api_local_agents():
     标出哪些 CLI 暂无底座后端（installed 但 supported=false），不假装支持。
     """
     from easel.local_agents import summarize_local_agents
-    return summarize_local_agents()
+    return await asyncio.to_thread(summarize_local_agents)
 
 
 @app.post("/api/settings/local-agents/enable")
@@ -1796,7 +2443,7 @@ def _set_openclaw_primary(primary_ref: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
         if ref.get('primary') == primary_ref:
             return ''
@@ -1820,7 +2467,7 @@ def _declare_anthropic_provider(base: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         if isinstance(prov, dict) and prov.get('baseUrl') == base:
@@ -1859,6 +2506,7 @@ class ModelsFetchRequest(BaseModel):
 
 # slot → (base 键, key 键)；与 _SLOT_ENV_KEYS 同源，外加自定义供应商。
 _FETCH_KEY_BY_SLOT = {
+    'direct-api': ('EASEL_DIRECT_API_BASE_URL', 'EASEL_DIRECT_API_KEY'),
     'openai': ('OPENAI_BASE_URL', 'OPENAI_API_KEY'),
     'relay': ('EASEL_LLM_BASE_URL', 'EASEL_LLM_API_KEY'),
     'anthropic': ('ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'),
@@ -1878,7 +2526,7 @@ async def api_models_available(req: ModelsFetchRequest):
     slot = (req.slot or "").strip()
     # 草稿没填 key 时，回落到该槽位已存的值（只在内存里用，不回显、不记日志）。
     if not key and slot:
-        _env = _read_env()
+        _env = read_settings(ENV_FILE) if _direct_api_enabled() else _read_env()
         if slot == 'custom':
             # 自定义供应商的凭据在 openclaw.json 里（provider 名 = 用户填的名字）
             _b, _k = _openclaw_provider_creds().get((req.name or '').strip().lower(), ("", ""))
@@ -1886,29 +2534,34 @@ async def api_models_available(req: ModelsFetchRequest):
             _bk, _kk = _FETCH_KEY_BY_SLOT.get(slot, ("", ""))
             _b, _k = _env.get(_bk, ""), _env.get(_kk, "")
         key = (_k or "").strip()
+        if slot == "direct-api" and key and base and base != (_b or "").strip().rstrip("/"):
+            raise HTTPException(400, "更换根地址时必须重新填写 Key，不能把已存 Key 发给其他地址")
         if not base and _b:
             base = _b.strip().rstrip("/")
     if not base:
         raise HTTPException(400, "Base URL 不能为空")
     if not _valid_base_url(base):
         raise HTTPException(400, "Base URL 不合法")
-    if not _ssrf_safe(base):
+    if not _model_target_allowed(base, slot):
         raise HTTPException(400, "目标指向本机/内网地址，已拒绝（避免把 API Key 发给内网服务）")
 
-    anthropic = (req.protocol or "").strip().lower() == "anthropic"
+    anthropic = slot != "direct-api" and (req.protocol or "").strip().lower() == "anthropic"
     if anthropic:
         url = base + "/v1/models"
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
                    "Authorization": f"Bearer {key}"}
     else:
         url = base + "/models"
-        headers = {"Authorization": f"Bearer {key}"}
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *_a, **_kw):
             return None
 
-    _opener = urllib.request.build_opener(_NoRedirect)
+    handlers = [_NoRedirect]
+    if slot == "direct-api" and _direct_api_enabled() and base == read_settings(ENV_FILE).get("EASEL_DIRECT_API_BASE_URL", "").strip().rstrip("/"):
+        handlers.append(urllib.request.ProxyHandler({}))
+    _opener = urllib.request.build_opener(*handlers)
 
     def _fetch() -> list[str]:
         rq = urllib.request.Request(url, headers=headers)
@@ -1939,21 +2592,29 @@ async def api_models_available(req: ModelsFetchRequest):
 async def api_models_selftest(req: SelftestRequest):
     """真自测：对已配置的 OpenAI 兼容通道发 GET {base}/models 并计耗时。"""
     channel = (req.channel or "all").strip()
-    env = _read_env()
-    # (base, key, 是否为 Anthropic Messages 协议)。协议决定探测用的鉴权头与路径：
+    if channel in ("chat", "all") and _harness_settings()["runtime"] not in ("api", "openclaw"):
+        raise HTTPException(409, "此底座使用原生模型配置，请新建对话或运行 easel ping 验证")
+    direct = _direct_api_enabled()
+    env = read_settings(ENV_FILE) if direct else _read_env()
+    # (base, key, 是否为 Anthropic Messages 协议, slot)。协议决定鉴权头与路径：
     # Anthropic 是 x-api-key + /v1/models，OpenAI 兼容是 Bearer + /models。
-    targets: list[tuple[str, str, bool]] = []
+    targets: list[tuple[str, str, bool, str]] = []
     if channel in ("chat", "all"):
-        for base, key, is_anthropic in (
-            (env.get("ANTHROPIC_BASE_URL", ""), env.get("ANTHROPIC_API_KEY", ""), True),
-            (env.get("OPENAI_BASE_URL", ""), env.get("OPENAI_API_KEY", ""), False),
-            (env.get("EASEL_LLM_BASE_URL", ""), env.get("EASEL_LLM_API_KEY", ""), False),
-        ):
-            if base.strip() and key.strip():
-                targets.append((base.strip().rstrip("/"), key.strip(), is_anthropic))
+        if direct:
+            chat_targets = ((env.get("EASEL_DIRECT_API_BASE_URL", ""),
+                             env.get("EASEL_DIRECT_API_KEY", ""), False, "direct-api"),)
+        else:
+            chat_targets = (
+                (env.get("ANTHROPIC_BASE_URL", ""), env.get("ANTHROPIC_API_KEY", ""), True, "anthropic"),
+                (env.get("OPENAI_BASE_URL", ""), env.get("OPENAI_API_KEY", ""), False, "openai"),
+                (env.get("EASEL_LLM_BASE_URL", ""), env.get("EASEL_LLM_API_KEY", ""), False, "relay"),
+            )
+        for base, key, is_anthropic, slot in chat_targets:
+            if base.strip() and (key.strip() or direct):
+                targets.append((base.strip().rstrip("/"), key.strip(), is_anthropic, slot))
     if channel in ("transcribe", "all") and (env.get("SILICONFLOW_API_KEY") or "").strip():
         targets.append(((env.get("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1").strip().rstrip("/"),
-                        env["SILICONFLOW_API_KEY"].strip(), False))
+                        env["SILICONFLOW_API_KEY"].strip(), False, "siliconflow"))
 
     # 这里会把真实 API Key 当 Bearer 发出去，所以目标地址必须先过闸：
     # 合法 http(s)、且不指向本机/内网/云元数据；跳转也不跟（跟了等于绕过前面的判断）。
@@ -1963,11 +2624,11 @@ async def api_models_selftest(req: SelftestRequest):
 
     _opener = urllib.request.build_opener(_NoRedirect)
 
-    def _probe(base: str, key: str, *, anthropic: bool = False) -> dict:
+    def _probe(base: str, key: str, *, anthropic: bool = False, slot: str = "") -> dict:
         t0 = time.time()
         if not _valid_base_url(base):
             return {"baseUrl": base, "ok": False, "ms": 0, "detail": "Base URL 不合法，未发起请求"}
-        if not _ssrf_safe(base):
+        if not _model_target_allowed(base, slot):
             return {"baseUrl": base, "ok": False, "ms": 0,
                     "detail": "目标指向本机/内网地址，已拒绝（避免把 API Key 发给内网服务）"}
         try:
@@ -1983,8 +2644,12 @@ async def api_models_selftest(req: SelftestRequest):
                     "Authorization": f"Bearer {key}",
                 })
             else:
-                rq = urllib.request.Request(base + "/models", headers={"Authorization": f"Bearer {key}"})
-            with _opener.open(rq, timeout=15) as resp:
+                headers = {"Authorization": f"Bearer {key}"} if key else {}
+                rq = urllib.request.Request(base + "/models", headers=headers)
+            opener = _opener
+            if slot == "direct-api" and base == env.get("EASEL_DIRECT_API_BASE_URL", "").strip().rstrip("/"):
+                opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+            with opener.open(rq, timeout=15) as resp:
                 return {"baseUrl": base, "ok": resp.status == 200, "ms": int((time.time() - t0) * 1000)}
         except Exception as e:  # noqa: BLE001
             return {"baseUrl": base, "ok": False, "ms": int((time.time() - t0) * 1000),
@@ -1992,8 +2657,8 @@ async def api_models_selftest(req: SelftestRequest):
 
     def _run_probes() -> list[dict]:
         out: list[dict] = []
-        for base, key, is_anthropic in targets:
-            out.append(_probe(base, key, anthropic=is_anthropic))
+        for base, key, is_anthropic, slot in targets:
+            out.append(_probe(base, key, anthropic=is_anthropic, slot=slot))
         return out
 
     results = await asyncio.to_thread(_run_probes)
@@ -2069,7 +2734,39 @@ def _chat_message(req: ChatRequest) -> str:
         message = f"{message}\n\n{context}" if message else context
     if not message:
         raise HTTPException(400, "消息不能为空")
-    return chat_turn_message(message, req.persona)
+    return _publishing_message(chat_turn_message(message, req.persona))
+
+
+def _direct_chat_content(req: ChatRequest) -> tuple[str | list, str]:
+    _attachment_context(req)  # Reuse ownership/path validation before reading any attachment.
+    message = req.message.strip()
+    if not message and not req.attachments:
+        raise HTTPException(400, "消息不能为空")
+    system = SYSTEM_PROMPT
+    if req.persona:
+        if not _valid_persona_name(req.persona) or not profile_exists(req.persona):
+            raise HTTPException(400, "画像不存在或名称无效")
+        system += "\n\n当前画像：\n" + load_profile_text(req.persona)
+    content = [{"type": "text", "text": message or "请分析这些附件"}]
+    for attachment in req.attachments:
+        path = _safe_output_target(attachment.path)
+        if path.suffix.lower() in TEXT_EXTS:
+            if path.stat().st_size > 65536:
+                raise HTTPException(413, "API 直连模式文本附件不能超过 64 KiB")
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeError:
+                raise HTTPException(400, "文本附件需要 UTF-8 编码") from None
+            content.append({"type": "text", "text": f"附件 {attachment.name}：\n{text}"})
+        elif path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            if path.stat().st_size > 4 * 1024 * 1024:
+                raise HTTPException(413, "API 直连模式图片附件不能超过 4 MiB")
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+        else:
+            raise HTTPException(400, "API 直连模式支持文本和图片附件；此附件需要文件处理工具")
+    return (content if req.attachments else message), system
 
 
 # 每个会话（session-key）一把锁：防止同一会话被两个并发的 openclaw agent 进程同时处理。
@@ -2244,11 +2941,25 @@ def _read_job_events(turn_id: str, after: int = 0) -> list[dict]:
         return []
     events = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            if int(event.get("id", 0)) > after:
-                events.append(event)
-    except (OSError, ValueError, json.JSONDecodeError):
+        # Read/decode each record separately: a concurrent append can end in
+        # partial JSON or even half a UTF-8 character. Keep valid records and
+        # retry the incomplete tail on the next read without changing the log.
+        with path.open("rb") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("id")
+                if (type(event_id) is not int or event_id <= 0
+                        or not isinstance(event.get("event"), str)
+                        or not event["event"]):
+                    continue
+                if event_id > after:
+                    events.append(event)
+    except OSError:
         return []
     return events
 
@@ -2299,11 +3010,228 @@ def _save_turn(sk: str, status: str, text: str, extra: dict | None = None) -> No
 # 后台 supervisor 任务集合：持有强引用防被 GC；每个对话流的 openclaw run 跑在这里，
 # 与客户端 SSE 连接解耦（断线不杀 run）。
 _BG_TASKS: set = set()
+_DIRECT_CHAT_TASKS: set = set()
 
 # 正在跑的对话 openclaw 进程（sk→proc），供用户**显式「停止」**终止；断线**不**经此路径（断线不杀）。
 _RUNNING_CHAT: dict = {}
 # 被用户显式停止的会话 key：supervisor 据此把本轮当作正常「已停止」收尾（不报「被中断」、释放会话锁）。
 _STOPPED_CHAT: set = set()
+_HARNESS_TASKS: set = set()
+_HARNESS_QUESTIONS: dict = {}
+
+
+class _HarnessProc(_GatewayHttpProc):
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_requested = False
+
+    def terminate(self) -> None:
+        if self._task is not None:
+            task = self._task
+            def cancel_once():
+                if (not task.done() and not self._cancel_requested
+                        and not getattr(task, "cancelling", lambda: 0)()):
+                    self._cancel_requested = True
+                    task.cancel()
+            task.get_loop().call_soon_threadsafe(cancel_once)
+
+
+async def _harness_ask(sk: str, questions: list[dict], emit) -> dict:
+    identifier = "harness_" + uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    record = {"session": sk, "future": future, "status": "pending", "questions": questions}
+    _HARNESS_QUESTIONS[identifier] = record
+    try:
+        emit("question", _scrub_secrets(json.dumps(
+            {"id": identifier, "questions": questions}, ensure_ascii=False)))
+        answers = await asyncio.wait_for(future, TIMEOUT_CHAT)
+        record["status"] = "resolved"
+        return answers
+    finally:
+        _HARNESS_QUESTIONS.pop(identifier, None)
+
+
+async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: str,
+                            config: dict, emit, timeout: int = TIMEOUT_CHAT, *, interactive=True) -> str:
+    pk = f"web:{sk}"
+    turn_id = req.turnId or uuid.uuid4().hex
+    full_text: list[str] = []
+    clean_end = False
+    reason = "error"
+    error_message = ""
+    lock = _session_lock(sk)
+    xlock = _CrossProcLock(sk)
+    acquired = False
+    claimed = False
+    locked = False
+    proc = _HarnessProc()
+    task = asyncio.current_task()
+    _HARNESS_TASKS.add(task)
+
+    def receive(kind, text):
+        safe = _scrub_secrets(text)
+        if kind == "token":
+            full_text.append(safe)
+        emit(kind, safe)
+
+    async def ask(questions):
+        if not interactive:
+            raise HarnessError("此操作需要权限确认，请在流式对话中执行并确认权限")
+        return await _harness_ask(sk, questions, receive)
+
+    try:
+        if lock.locked():
+            emit("activity", "这个会话上一条还在运行，等待完成…")
+        await lock.acquire()
+        locked = True
+        deadline = time.monotonic() + min(timeout, 300)
+        while not acquired and time.monotonic() < deadline:
+            acquired = xlock.acquire(0)
+            if not acquired:
+                xlock.release()
+                await asyncio.sleep(0.2)
+        if not acquired:
+            raise HarnessError("此会话正在另一个窗口运行，请稍后再试")
+        if _chat_backend(sk) != runtime:
+            raise HarnessError("底座已切换，请使用新对话重试")
+        record = harness_store.binding(SESSIONS_DIR, sk)
+        native_id = record.get("native_id", "")
+        harness_store.bind(SESSIONS_DIR, sk, runtime, native_id)
+        _STOPPED_CHAT.discard(sk)
+        proc._task = task
+        _RUNNING_CHAT[sk] = proc
+        _save_turn(pk, "running", "", {"turn_id": turn_id, "runtime": runtime})
+        claimed = True
+        env = {**read_settings(ENV_FILE), **_proxy_env(), "EASEL_AGENT_RUNTIME": runtime,
+               "EASEL_ROOT": str(PROJECT_ROOT)}
+        request = RunRequest(message, PROJECT_ROOT, env, native_id,
+                             config["models"].get(runtime, ""), config["sandbox"], timeout,
+                             session_key=sk, codex_auto_approve=config.get("codex_auto_approve", False))
+        await asyncio.wait_for(harnesses.adapter(runtime).run(
+            request, receive, ask,
+            lambda identifier: harness_store.bind(SESSIONS_DIR, sk, runtime, identifier)), timeout)
+        clean_end = True
+        reason = "completed"
+    except asyncio.CancelledError:
+        reason = "stopped" if sk in _STOPPED_CHAT else "shutdown"
+        emit("activity", "已停止" if reason == "stopped" else "服务关闭，本轮已取消")
+    except asyncio.TimeoutError:
+        reason = "timeout"
+        error_message = "Agent 执行超时，已终止本轮进程"
+        emit("error", error_message)
+    except (HarnessError, HTTPException) as error:
+        error_message = _scrub_secrets(str(error.detail if isinstance(error, HTTPException) else error))
+        emit("error", error_message)
+    except Exception:
+        error_message = "Agent 执行失败，请检查本机 CLI、登录和模型配置"
+        emit("error", error_message)
+    finally:
+        if claimed:
+            snapshot = "".join(full_text) + (f"\n\n❌ {error_message}" if error_message else "")
+            _save_turn(pk, "done", snapshot, {
+                "turn_id": turn_id, "runtime": runtime,
+                "clean_end": clean_end, "stop_reason": reason})
+        # 注意：claim 失败（锁被占/底座已切换）时刻意**不**落盘——保留上一轮的
+        # 结果快照不被失败轮覆盖（见 test_failed_ownership_check_does_not_overwrite_
+        # previous_result）；错误经 SSE 事件流（job log）回放可见。
+        proc.finish()
+        if _RUNNING_CHAT.get(sk) is proc:
+            _RUNNING_CHAT.pop(sk, None)
+        if claimed:
+            _STOPPED_CHAT.discard(sk)
+        xlock.release()
+        if locked:
+            lock.release()
+        _HARNESS_TASKS.discard(task)
+    return "".join(full_text)
+
+
+async def _run_direct_chat(req: ChatRequest, sk: str, content, system: str, emit) -> str:
+    """Run one API turn with the same stop/recovery/session locking as Gateway chat."""
+    pk = f"web:{sk}"
+    turn_id = req.turnId or uuid.uuid4().hex
+    full_text = []
+    clean_end = False
+    reason = "error"
+    error_message = ""
+    lock = _session_lock(sk)
+    xlock = _CrossProcLock(sk)
+    proc = _GatewayHttpProc()
+    acquired = False
+    claimed = False
+    locked = False
+    settings = read_settings(ENV_FILE)
+    task = asyncio.current_task()
+    _DIRECT_CHAT_TASKS.add(task)
+    if lock.locked():
+        emit("activity", "⏳ 这个会话上一条还在跑，排队等它结束…")
+    try:
+        await lock.acquire()
+        locked = True
+        deadline = time.monotonic() + min(TIMEOUT_CHAT, 300)
+        while True:
+            acquired = xlock.acquire(0)
+            if acquired:
+                break
+            xlock.release()
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.2)
+        if not acquired:
+            raise DirectAPIError("这个会话正在另一个窗口运行，请稍候再试")
+        # Existing OpenClaw conversations have different histories. Require a new
+        # session rather than silently discard their context when switching modes.
+        if (_transport_pin_file(sk).is_file()
+                or (OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(sk)}.jsonl").is_file()
+                or (OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(pk)}.jsonl").is_file()):
+            raise DirectAPIError("此会话属于 OpenClaw，请新建会话使用 API 直连")
+        _save_turn(pk, "running", "", {"turn_id": turn_id})
+        claimed = True
+        proc._task = asyncio.current_task()
+        _RUNNING_CHAT[sk] = proc
+        emit("activity", "🧠 正在通过 API 思考…")
+
+        async def consume():
+            nonlocal clean_end, reason
+            async for kind, text in stream_chat(
+                    settings, content, system=system,
+                    history_file=history_path(SESSIONS_DIR, sk), timeout=TIMEOUT_CHAT):
+                if kind == "finish":
+                    clean_end, reason = True, text
+                else:
+                    if kind == "token":
+                        full_text.append(text)
+                    emit(kind, text)
+
+        await asyncio.wait_for(consume(), timeout=TIMEOUT_CHAT)
+    except asyncio.CancelledError:
+        reason = "user_stopped" if sk in _STOPPED_CHAT else "cancelled"
+        if reason != "user_stopped":
+            raise
+    except (DirectAPIError, asyncio.TimeoutError) as error:
+        error_message = str(error) or "API 请求超时"
+        emit("error", error_message)
+    except OSError:
+        error_message = "会话历史保存失败，请检查项目 outputs 目录权限"
+        emit("error", error_message)
+    finally:
+        proc.finish()
+        snapshot = "".join(full_text) + (f"\n\n❌ {error_message}" if error_message else "")
+        try:
+            if claimed:
+                _save_turn(pk, "done", snapshot, {
+                    "turn_id": turn_id, "clean_end": clean_end, "stop_reason": reason,
+                })
+        finally:
+            if _RUNNING_CHAT.get(sk) is proc:
+                _RUNNING_CHAT.pop(sk, None)
+            if claimed:
+                _STOPPED_CHAT.discard(sk)
+            xlock.release()
+            if locked:
+                lock.release()
+            _DIRECT_CHAT_TASKS.discard(task)
+    return "".join(full_text)
 
 
 @app.get("/api/chat/last/{session_id}")
@@ -2338,10 +3266,20 @@ async def api_chat_job_stream(turn_id: str, after: int = 0):
                 idle_since = time.monotonic()
                 for event in batch:
                     cursor = int(event["id"])
+                    raw = event.get("data")
+                    # job 日志里 question 的 data 已是序列化 JSON 字符串（实时流
+                    # forward() 对 question 原样透传），这里若再 json.dumps 会双层
+                    # 转义 → 前端 JSON.parse 拿到字符串而非对象 → ask_user 选项
+                    # 卡片渲染成空壳。其余事件存原文/dict，与实时流的 dumps 规则
+                    # 一致。因此仅 question 按实时流规则原样透传。
+                    if event["event"] in ("question", "question_closed") and isinstance(raw, str):
+                        data_out = raw
+                    else:
+                        data_out = json.dumps(raw, ensure_ascii=False)
                     yield {
                         "id": str(cursor),
                         "event": event["event"],
-                        "data": json.dumps(event.get("data"), ensure_ascii=False),
+                        "data": data_out,
                     }
                     if event["event"] in ("done", "error"):
                         return
@@ -2370,7 +3308,17 @@ async def api_chat_stream(req: ChatRequest):
     token delta 转成 SSE `token`、thinking delta 转成 `thinking`。stdout 仅留作错误/兜底。
     """
     # 每轮末尾追加「先查技能库」提醒，抗长对话指令衰减（对用户不可见）
-    message = _chat_message(req)
+    runtime = _chat_backend(req.sessionId)
+    config = _harness_settings()
+    direct = runtime == "api"
+    alternate = runtime not in ("api", "openclaw")
+    if direct:
+        content, system = _direct_chat_content(req)
+        message = ""
+    else:
+        if req.sessionId and history_path(SESSIONS_DIR, req.sessionId).is_file():
+            raise HTTPException(409, "此会话属于 API 直连，请新建会话使用 OpenClaw")
+        message = _chat_message(req)
 
     # supervisor（跑 openclaw run）与 forward（转发 SSE 给浏览器）之间的事件通道。
     # 关键：run 跑在独立后台任务里，客户端断开只结束 forward，不取消 supervisor →
@@ -2386,9 +3334,6 @@ async def api_chat_stream(req: ChatRequest):
         event_seq = 0
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
-
-        # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
-        _save_turn(pk, "running", "", {"turn_id": turn_id})
 
         event_path = _job_event_file(turn_id)
         try:
@@ -2411,7 +3356,25 @@ async def api_chat_stream(req: ChatRequest):
             client_q.put_nowait({"t": kind, "text": text, "id": event_seq, **extra})
 
         # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
-        to_client("activity", "⏳ 已收到，正在唤醒 agent…")
+        to_client("activity", "⏳ 已收到…" if direct else "⏳ 已收到，正在唤醒 agent…")
+
+        if direct:
+            try:
+                await _run_direct_chat(
+                    req.model_copy(update={"turnId": turn_id}), sk, content, system, to_client)
+            finally:
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+            return
+
+        if alternate:
+            try:
+                await _run_harness_chat(req.model_copy(update={"turnId": turn_id}),
+                                        sk, message, runtime, config, to_client)
+            finally:
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+            return
 
         async def _run_gateway_turn(hproc):
             """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。
@@ -2468,11 +3431,14 @@ async def api_chat_stream(req: ChatRequest):
                             if rc:
                                 run_info["sse_thinking"] = True
                                 run_info["thinking_chars"] += len(rc)
-                                _emit("thinking", rc)
+                                q.put_nowait({"t": "thinking", "text": rc})
                             c = delta.get("content")
                             if c:
                                 got_text = True
-                                _emit("token", c)
+                                # Already on the event loop: enqueue directly.
+                                # _emit schedules a callback which can run after
+                                # this coroutine's completion sentinel.
+                                q.put_nowait({"t": "token", "text": c})
                             if delta.get("tool_calls") and not tool_noted:
                                 tool_noted = True
                                 to_client("activity", "🔧 正在执行操作…")
@@ -2492,19 +3458,10 @@ async def api_chat_stream(req: ChatRequest):
                 q.put_nowait(SENTINEL)
                 hproc.finish()
 
-        _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
-        # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
-        # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
-        # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
-        try:
-            raw_start_offset = SHARED_RAW_STREAM.stat().st_size
-        except OSError:
-            raw_start_offset = 0
-
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
             "--session-key", f"agent:main:{sk}", "--session-id", _openclaw_session_id(sk),
-            "--thinking", THINKING_LEVEL,
+            "--thinking", _agent_thinking_level(),
             "--timeout", str(TIMEOUT_CHAT), "--message", message,
         ]
         env = _proxy_env()
@@ -2523,41 +3480,75 @@ async def api_chat_stream(req: ChatRequest):
         xlock = _CrossProcLock(sk)
         if lock.locked():
             to_client("activity", "⏳ 这个会话上一条还在跑，排队等它结束再开始…")
-        await lock.acquire()
-        # flock 可能阻塞（等另一进程/标签跑完），放线程池避免卡住事件循环
-        got = await loop.run_in_executor(None, xlock.acquire, min(TIMEOUT_CHAT, 300))
-        if not got:
-            lock.release()
-            _save_turn(pk, "done", "这个会话正在另一个窗口运行，请稍候再试。", {
-                "turn_id": turn_id, "clean_end": False, "stop_reason": "session_lock_timeout",
-            })
-            to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
-            to_client("done", sessionKey=sk)
-            client_q.put_nowait(CLIENT_DONE)
-            return
+        locked = claimed = started = False
+        startup_reason = "spawn_failed"
+        startup_error = None
+        try:
+            await lock.acquire()
+            locked = True
+            # Match direct-API locking: nonblocking attempts with cancellable
+            # sleeps. An executor worker could acquire a lock after cancellation
+            # and outlive its owner, leaving the session permanently locked.
+            lock_deadline = time.monotonic() + min(TIMEOUT_CHAT, 300)
+            while True:
+                if xlock.acquire(0):
+                    break
+                xlock.release()
+                if time.monotonic() >= lock_deadline:
+                    startup_error = "这个会话正在另一个窗口运行，请稍候再试。"
+                    return
+                await asyncio.sleep(0.2)
 
-        # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
-        # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
-        is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
-        if is_http:
-            # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
-            proc = _GatewayHttpProc()
-        else:
+            # Only the owner of both locks may replace the session snapshot.
+            _save_turn(pk, "running", "", {"turn_id": turn_id})
+            claimed = True
+
+            # 拿到两层锁之后再清洗历史：sanitize 是读-改-写，若与上一轮仍往同一
+            # transcript 追加的 openclaw 并发，会丢掉 heal 读到 replace 之间追加的行。
+            _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
+
+            # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
+            # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
+            # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
             try:
+                raw_start_offset = SHARED_RAW_STREAM.stat().st_size
+            except OSError:
+                raw_start_offset = 0
+
+            # Transport selection includes a blocking network probe; keep it
+            # off the event loop. It cannot start an agent or acquire locks.
+            is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+            if is_http:
+                # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
+                proc = _GatewayHttpProc()
+            else:
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
                 )
-            except BaseException:
-                lock.release()
+            started = True
+        except asyncio.CancelledError:
+            startup_reason = "cancelled"
+            raise
+        except Exception:
+            startup_error = "❌ 启动失败，请重试"
+            return
+        finally:
+            if not started:
+                # A queued/cancelled waiter never owns the previous snapshot.
+                # Persist an owned failure before releasing either lock.
+                if claimed:
+                    _save_turn(pk, "done", startup_error or "", {
+                        "turn_id": turn_id, "clean_end": False,
+                        "stop_reason": startup_reason,
+                    })
                 xlock.release()
-                _save_turn(pk, "done", "❌ 启动失败，请重试", {
-                    "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
-                })
-                to_client("error", "❌ 启动失败，请重试")
+                if locked:
+                    lock.release()
+                if startup_error:
+                    to_client("error", startup_error)
                 to_client("done", sessionKey=sk)
                 client_q.put_nowait(CLIENT_DONE)
-                return
         _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
         # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
         # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
@@ -2601,67 +3592,17 @@ async def api_chat_stream(req: ChatRequest):
         # 背景：OpenClaw 的 ask_user 注册到 gateway 进程内，Easel 前端不消费 question RPC → 选项不可见。
         # 这里在 agent 运行期间每 2s 轮询一次，把新出现的 pending question 以 SSE `question` 事件推送，
         # 前端渲染选项卡片；用户点击后经 /api/chat/question/answer 调 question.resolve 完成回答。
+        question_stop = threading.Event()
+        question_poll_fut = None
+        question_events_open = True
+
+        def emit_question(kind: str, payload: str):
+            if question_events_open:
+                _emit(kind, _scrub_secrets(payload))
+
         if GatewayClient is not None and not _QBRIDGE_DISABLED:
-            def _question_poll():
-                global _QBRIDGE_DISABLED
-                if _QBRIDGE_DISABLED:
-                    return
-                # 版本能力门：旧版本 OpenClaw（<2026.9.x）没有 question.* RPC，连都不连——
-                # 否则每轮 connect 都在网关上触发新的 scope-upgrade 配对申请。只提示一次，走文字问答。
-                if question_bridge_supported is not None and not question_bridge_supported():
-                    _QBRIDGE_DISABLED = True
-                    _qbridge_warn_once(
-                        "unsupported",
-                        "[question-bridge] 当前 OpenClaw 版本无 question RPC（需 2026.9.x+），"
-                        "已跳过 ask_user 选项卡片桥接，改用文字问答。")
-                    return
-                client = None
-                pushed: set[str] = set()
-                try:
-                    client = GatewayClient()
-                    client.connect()
-                except Exception as e:
-                    # connect 失败（如 NOT_PAIRED/scope-upgrade，或网关不可达）：熔断整个桥接，
-                    # 不再每轮重试——否则每轮都会在网关上堆一个新的配对/权限申请。每进程只告警一次。
-                    _QBRIDGE_DISABLED = True
-                    _qbridge_warn_once(
-                        "connect",
-                        f"[question-bridge] connect gateway failed，已停用桥接（本进程），"
-                        f"ask_user 改用文字问答: {e}")
-                    return
-                try:
-                    while proc.poll() is None:
-                        try:
-                            items = client.list_questions(
-                                session_key=f"agent:main:{sk}", status="pending")
-                        except GatewayUnsupportedError as e:
-                            # 连上了但没有 question RPC（版本判断漏网时的兜底）：熔断，安静退出。
-                            _QBRIDGE_DISABLED = True
-                            _qbridge_warn_once(
-                                "unsupported",
-                                f"[question-bridge] 当前 OpenClaw 版本无 question RPC，"
-                                f"已停用 ask_user 选项卡片桥接（需 2026.9.x+）: {e}")
-                            return
-                        except Exception:
-                            time.sleep(2)
-                            continue
-                        for it in items:
-                            qid = it.get("id")
-                            if qid and qid not in pushed:
-                                pushed.add(qid)
-                                _emit("question", json.dumps({
-                                    "id": qid,
-                                    "questions": it.get("questions", []),
-                                    "expiresAtMs": it.get("expiresAtMs"),
-                                }, ensure_ascii=False))
-                        time.sleep(2)
-                finally:
-                    try:
-                        if client is not None:
-                            client.close()
-                    except Exception:
-                        pass
-            loop.run_in_executor(None, _question_poll)
+            question_poll_fut = loop.run_in_executor(
+                None, _poll_gateway_questions, sk, proc, emit_question, question_stop)
 
         def _handle(line: str):
             o = _raw_event_for_run(line, run_info["run_id"])
@@ -2737,7 +3678,10 @@ async def api_chat_stream(req: ChatRequest):
             except Exception:
                 pass
             finally:
-                loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
+                # HTTP completion belongs to _run_gateway_turn. The optional
+                # raw reader must not end that stream or overtake its tokens.
+                if not is_http:
+                    loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
 
         stdout_fut = None
         if is_http:
@@ -2784,8 +3728,14 @@ async def api_chat_stream(req: ChatRequest):
                     to_client("thinking", item["text"])
                 elif item["t"] == "activity":
                     to_client("activity", item["text"])
-                elif item["t"] == "question":
-                    to_client("question", item["text"])
+                elif item["t"] in ("question", "question_closed"):
+                    to_client(item["t"], item["text"])
+            question_stop.set()
+            if question_poll_fut is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(question_poll_fut), timeout=2)
+                except Exception:
+                    pass
             rc = proc.poll()
             # 等 stdout 读完（stopReason 行在进程收尾时才打印，避免 _tail 先发 SENTINEL 时漏读）
             if stdout_fut is not None:
@@ -2854,6 +3804,12 @@ async def api_chat_stream(req: ChatRequest):
                         await asyncio.to_thread(proc.wait, timeout=2)
                     except (OSError, subprocess.TimeoutExpired):
                         pass
+            question_stop.set()
+            question_events_open = False
+            while not q.empty():
+                queued = q.get_nowait()
+                if queued is not SENTINEL and queued["t"] in ("question", "question_closed"):
+                    to_client(queued["t"], queued["text"])
             # 诊断日志：每次对话流收尾都记一行，供事后定位「莫名停下」到底是哪种情况。
             try:
                 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2895,6 +3851,9 @@ async def api_chat_stream(req: ChatRequest):
 
     def _bg_done(t):
         _BG_TASKS.discard(t)
+        if t.cancelled():
+            client_q.put_nowait(CLIENT_DONE)
+            return
         try:
             exc = t.exception()   # 取出异常避免「never retrieved」告警
         except Exception:
@@ -2937,8 +3896,8 @@ async def api_chat_stream(req: ChatRequest):
                 yield {"id": str(item["id"]), "event": "thinking", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "activity":
                 yield {"id": str(item["id"]), "event": "activity", "data": json.dumps(item["text"], ensure_ascii=False)}
-            elif t == "question":
-                yield {"id": str(item["id"]), "event": "question", "data": item["text"]}
+            elif t in ("question", "question_closed"):
+                yield {"id": str(item["id"]), "event": t, "data": item["text"]}
             elif t == "error":
                 yield {"id": str(item["id"]), "event": "error", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "done":
@@ -2957,6 +3916,22 @@ class QuestionAnswerRequest(BaseModel):
 @app.post("/api/chat/question/answer")
 async def api_question_answer(req: QuestionAnswerRequest):
     """前端点击 ask_user 选项后调用：转发 gateway question.resolve，让等待的 agent 拿到答案。"""
+    if req.questionId.startswith("harness_"):
+        record = _HARNESS_QUESTIONS.get(req.questionId)
+        if record is None:
+            return {"ok": False, "expired": True, "status": "expired",
+                    "error": "权限或问答请求已过期，请重试"}
+        required = {question["questionId"] for question in record["questions"]}
+        if set(req.answers or {}) != required:
+            raise HTTPException(400, "回答与当前问题不匹配")
+        if record["future"].done():
+            return {"ok": False, "expired": True, "status": "resolved", "error": "请求已回答"}
+        record["future"].set_result(req.answers)
+        return {"ok": True}
+    if _direct_api_enabled():
+        raise HTTPException(409, "API 直连模式使用文字问答，请新建对话")
+    if _harness_settings()["runtime"] != "openclaw":
+        raise HTTPException(409, "此问题属于旧 OpenClaw 会话，请使用当前底座的新对话")
     if GatewayClient is None:
         return {"ok": False, "error": "gateway question bridge unavailable"}
     client = GatewayClient()
@@ -2964,6 +3939,9 @@ async def api_question_answer(req: QuestionAnswerRequest):
         client.connect()
         result = client.resolve(req.questionId, req.answers or {}, req.resolvedBy)
         return {"ok": True, "result": result}
+    except GatewayQuestionClosedError as error:
+        return {"ok": False, "expired": True, "status": "expired", "reason": error.reason,
+                "error": "此问题已关闭或过期，答案未发送。请在输入框中继续对话。"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -2977,6 +3955,14 @@ class QuestionStatusRequest(BaseModel):
 @app.post("/api/chat/question/status")
 async def api_question_status(req: QuestionStatusRequest):
     """批量查 question 状态（重放旧事件时过滤已解决的题）。"""
+    if req.questionIds and all(identifier.startswith("harness_") for identifier in req.questionIds):
+        return {"ok": True, "questions": {
+            identifier: {"status": _HARNESS_QUESTIONS.get(identifier, {}).get("status", "not_found")}
+            for identifier in req.questionIds}}
+    if _direct_api_enabled():
+        return {"ok": True, "questions": {qid: {"status": "not_found"} for qid in req.questionIds}}
+    if _harness_settings()["runtime"] != "openclaw":
+        return {"ok": False, "questions": {}}
     if GatewayClient is None:
         return {"ok": False, "questions": {}}
     client = GatewayClient()
@@ -2986,11 +3972,13 @@ async def api_question_status(req: QuestionStatusRequest):
         for qid in req.questionIds:
             try:
                 q = client.get_question(qid)
-                # QUESTION_NOT_FOUND 抛异常捕获后报 not_found；正常返回则按 status
-                out[qid] = {"status": q.get("status") if q else "not_found"}
-            except GatewayQuestionError as e:
-                # gateway 明确错：问题已清理/不存在 = 已答或已过期，一律 not_found
-                out[qid] = {"status": "not_found"}
+                out[qid] = _gateway_question_state(q)
+            except GatewayQuestionClosedError as error:
+                out[qid] = {"status": error.status}
+            except GatewayUnsupportedError:
+                return {"ok": False, "error": "gateway question status unsupported", "questions": {}}
+            except GatewayQuestionError:
+                out[qid] = {"status": "unknown"}
             except Exception:
                 out[qid] = {"status": "unknown"}   # 网络/连接异常：保持 unknown（前端保留显示，宁不缺题）
         return {"ok": True, "questions": out}
@@ -3035,6 +4023,32 @@ async def api_chat_stop(req: StopRequest):
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
     """非流式对话（备选）。"""
+    runtime = _chat_backend(req.sessionId)
+    if runtime not in ("api", "openclaw"):
+        message = _chat_message(req)
+        sk = req.sessionId or uuid.uuid4().hex
+        errors = []
+        def emit(kind, text):
+            if kind == "error":
+                errors.append(text)
+        result = await _run_harness_chat(req, sk, message, runtime, _harness_settings(), emit,
+                                         interactive=False)
+        if errors:
+            raise HTTPException(502, errors[0])
+        return {"response": result, "sessionKey": sk}
+    if runtime == "api":
+        content, system = _direct_chat_content(req)
+        errors = []
+        def emit(kind, text):
+            if kind == "error":
+                errors.append(text)
+        sk = req.sessionId or uuid.uuid4().hex
+        result = await _run_direct_chat(req, sk, content, system, emit)
+        if errors:
+            raise HTTPException(502, errors[0])
+        return {"response": result, "sessionKey": sk}
+    if req.sessionId and history_path(SESSIONS_DIR, req.sessionId).is_file():
+        raise HTTPException(409, "此会话属于 API 直连，请新建会话使用 OpenClaw")
     # 每轮末尾追加「先查技能库」提醒，抗长对话指令衰减（对用户不可见）
     message = _chat_message(req)
     loop = asyncio.get_event_loop()
@@ -3051,6 +4065,8 @@ class SkillRequest(BaseModel):
 
 @app.post("/api/skill")
 async def api_skill(req: SkillRequest):
+    if _direct_api_enabled():
+        raise HTTPException(409, "API 直连模式支持聊天；SKILL 执行需要具备本机工具的 Agent 运行时")
     skill_full = find_skill(req.skill)
     if skill_full is None:
         raise HTTPException(404, f"SKILL '{req.skill}' 不存在")
@@ -3068,6 +4084,45 @@ def api_outputs():
     # FastAPI 会自动放入线程池执行；若写成 async def 直调，扫描期间会阻塞事件循环，
     # 全站所有请求（含 /api/status）一起挂起等它。
     return get_output_tree()
+
+
+@app.get("/api/artifacts/archive")
+def api_artifact_archive(path: str):
+    full = _safe_output_path(path)
+    if full.suffix.lower() != '.zip':
+        raise HTTPException(400, '仅支持 ZIP 产物索引')
+    artifacts = []
+    seen = set()
+    extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.avif', '.bmp',
+                  '.ico', '.html', '.htm', '.mp4', '.webm', '.mov', '.m4v',
+                  '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.pdf'}
+    try:
+        with zipfile.ZipFile(full) as archive:
+            entries = archive.infolist()
+            if len(entries) > 1000:
+                raise HTTPException(400, '压缩包文件过多，暂不自动预览')
+            for entry in entries:
+                name = entry.filename
+                parts = name.split('/')
+                if (entry.is_dir() or name.startswith('/') or '\\' in name
+                        or any(not part or part.startswith(('.', '_')) for part in parts)
+                        or any(ord(character) < 32 for character in name)
+                        or Path(name).suffix.lower() not in extensions):
+                    continue
+                relative = (full.parent / name).relative_to(OUTPUTS_DIR.resolve()).as_posix()
+                try:
+                    original = _safe_output_path(relative)
+                except HTTPException:
+                    continue
+                if original.stat().st_size != entry.file_size or relative in seen:
+                    continue
+                seen.add(relative)
+                artifacts.append(relative)
+                if len(artifacts) >= 100:
+                    break
+    except (OSError, zipfile.BadZipFile):
+        raise HTTPException(400, '无法读取压缩包索引')
+    return {'paths': artifacts}
 
 
 @app.get("/api/output/{path:path}")
@@ -3179,11 +4234,27 @@ async def api_upload(
         ext = Path(name).suffix.lower()
         if ext not in UPLOAD_EXTS:
             raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        data = await f.read()
-        if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+        # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
+        # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
+        cap = MAX_UPLOAD_MB * 1024 * 1024
         target = _unique_upload_path(dest, name)
-        target.write_bytes(data)
+        size = 0
+        try:
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > cap:
+                        raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+                    out.write(chunk)
+        except HTTPException:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
         rel = f"_inbox/{scope}/{batch}/{target.name}"
         saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
     if not saved:
@@ -3285,15 +4356,15 @@ def _login_status(platform: str) -> dict:
     # A runner that exits before writing its status must become an actionable error,
     # never the ambiguous ``unknown`` state shown as an endless spinner in the UI.
     proc = LOGIN_PROCESSES.get(platform)
-    if data['state'] in ('unknown', 'starting') and proc is not None:
+    if data['state'] not in ('success', 'expired', 'error') and proc is not None:
         code = proc.poll()
         if code is not None:
             data = {'state': 'error', 'message': f'登录程序异常退出（退出码 {code}），请查看 outputs/_login/{platform}.log'}
     qr = LOGIN_DIR / f'{platform}.png'
-    if qr.is_file():
+    if data['state'] in ('qr_ready', 'window_login') and qr.is_file():
         data['qr'] = f'_login/{platform}.png'
         try:
-            data['qrTs'] = int(qr.stat().st_mtime)   # 二维码 mtime 作缓存键：码每刷新一次就变，前端 img 随之刷新
+            data['qrTs'] = qr.stat().st_mtime_ns // 1_000_000
         except OSError:
             data['qrTs'] = 0
     else:
@@ -3314,8 +4385,16 @@ async def api_accounts():
 
 
 @app.post("/api/login/{platform}")
-async def api_login_start(platform: str):
-    """启动某平台登录：浏览器平台后台跑 QR runner，轮询到二维码就绪即返回。"""
+async def api_login_start(platform: str, restart: bool = False):
+    if platform not in LOGIN_RUNNERS:
+        raise HTTPException(404, '未知平台')
+    lock = _LOGIN_START_LOCKS.setdefault(platform, asyncio.Lock())
+    async with lock:
+        return await _start_login(platform, restart)
+
+
+async def _start_login(platform: str, restart: bool = False):
+    """启动后台登录并立即返回，二维码由前端状态轮询获取。"""
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
@@ -3326,6 +4405,16 @@ async def api_login_start(platform: str):
         # 公众号不走扫码：前端应改用凭证表单提交到 /api/accounts/{platform}/credentials。
         return {'mode': 'credentials', 'configured': _wechat_has_credentials(),
                 'message': '微信公众号请填写 AppID / AppSecret'}
+    existing = LOGIN_PROCESSES.get(platform)
+    if existing is not None and existing.poll() is None:
+        if not restart:
+            return {'mode': 'qr', **_login_status(platform)}
+        try:
+            existing.terminate()
+            await asyncio.to_thread(existing.wait, timeout=8)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(409, '上一次登录仍在退出，请稍后重试') from None
+        LOGIN_PROCESSES.pop(platform, None)
     LOGIN_DIR.mkdir(parents=True, exist_ok=True)
     qr = LOGIN_DIR / f'{platform}.png'
     status = LOGIN_DIR / f'{platform}.json'
@@ -3349,6 +4438,7 @@ async def api_login_start(platform: str):
         except OSError:
             pass
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'login',
+               '--no-proxy',
                '--qr-out', str(qr), '--status-file', str(status),
                '--sms-code-file', str(code_file), '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'toutiao':
@@ -3365,16 +4455,18 @@ async def api_login_start(platform: str):
         _WHOAMI_CACHE.pop(platform, None)
     log_path = LOGIN_DIR / f'{platform}.log'
     log_file = log_path.open('a', encoding='utf-8')
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                            stdout=log_file, stderr=subprocess.STDOUT)
-    log_file.close()
+    login_env = _proxy_env()
+    login_env['PYTHONIOENCODING'] = 'utf-8'
+    login_env['PYTHONUTF8'] = '1'
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=login_env,
+                                stdout=log_file, stderr=subprocess.STDOUT)
+    finally:
+        log_file.close()
     LOGIN_PROCESSES[platform] = proc
-    for _ in range(50):
-        await asyncio.sleep(0.5)
-        s = _login_status(platform)
-        if s['qr'] or s['state'] in ('qr_ready', 'success', 'error', 'expired'):
-            return {'mode': 'qr', **s}
     s = _login_status(platform)
+    if s['state'] == 'unknown':
+        s.update(state='starting', message='正在启动浏览器并准备二维码…')
     return {'mode': 'qr', **s}
 
 
@@ -3447,7 +4539,8 @@ async def api_save_credentials(platform: str, req: WechatCredentials):
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
     _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    ok, msg = _wechat_verify_token()
+    # 验证要真连微信接口（最长 30s）：丢线程池，避免卡住整个事件循环
+    ok, msg = await asyncio.to_thread(_wechat_verify_token)
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop(platform, None)
     if ok:
@@ -3468,13 +4561,13 @@ def _mp_login_status() -> dict:
         except Exception:
             pass
     proc = LOGIN_PROCESSES.get("wechat-oa-mp")
-    if data["state"] in ("unknown", "starting") and proc is not None and proc.poll() is not None:
+    if data["state"] not in ("success", "expired", "error") and proc is not None and proc.poll() is not None:
         data = {"state": "error", "message": f"登录程序退出（码 {proc.poll()}），见 outputs/_login/wechat-oa-mp.log"}
     qr = LOGIN_DIR / "wechat-oa-mp.png"
-    if qr.is_file():
+    if data["state"] in ("qr_ready", "window_login") and qr.is_file():
         data["qr"] = "_login/wechat-oa-mp.png"
         try:
-            data["qrTs"] = int(qr.stat().st_mtime)
+            data["qrTs"] = qr.stat().st_mtime_ns // 1_000_000
         except OSError:
             data["qrTs"] = 0
     else:
@@ -3518,16 +4611,16 @@ async def api_mp_login_start(platform: str):
            "--proxy", wx_proxy, "--qr-out", str(LOGIN_DIR / "wechat-oa-mp.png"),
            "--status-file", str(LOGIN_DIR / "wechat-oa-mp.json"), "--timeout", "240"]
     log_file = (LOGIN_DIR / "wechat-oa-mp.log").open("a", encoding="utf-8")
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+    env = _proxy_env()
+    env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
+    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env,
                             stdout=log_file, stderr=subprocess.STDOUT)
     log_file.close()
     LOGIN_PROCESSES["wechat-oa-mp"] = proc
-    for _ in range(60):
-        await asyncio.sleep(0.5)
-        s = _mp_login_status()
-        if s["qr"] or s["state"] in ("qr_ready", "success", "error", "expired"):
-            return {"mode": "qr", **s}
-    return {"mode": "qr", **_mp_login_status()}
+    status = _mp_login_status()
+    if status["state"] == "unknown":
+        status.update(state="starting", message="正在启动浏览器并准备二维码…")
+    return {"mode": "qr", **status}
 
 
 @app.get("/api/accounts/{platform}/mp-login/status")
@@ -3539,7 +4632,22 @@ async def api_mp_login_status(platform: str):
 
 
 @app.get("/api/accounts/{platform}/whoami")
-async def api_account_whoami(platform: str):
+async def api_account_whoami(platform: str, force: bool = False):
+    if platform not in LOGIN_RUNNERS:
+        raise HTTPException(404, '未知平台')
+    task = _WHOAMI_TASKS.get(platform)
+    if task is None or task.done():
+        task = asyncio.create_task(_check_account_whoami(platform, force))
+        _WHOAMI_TASKS[platform] = task
+        def finish(completed):
+            if _WHOAMI_TASKS.get(platform) is completed:
+                _WHOAMI_TASKS.pop(platform, None)
+
+        task.add_done_callback(finish)
+    return await asyncio.shield(task)
+
+
+async def _check_account_whoami(platform: str, force: bool = False):
     """真校验登录态 + 读昵称/头像（起 headless 浏览器，数秒）。前端开页后台调用以自愈假阳性。
     带 TTL 进程内缓存（避免账号页+工作台重复起浏览器）；确认已登录则回写标记，令快速路径自愈。"""
     cfg = LOGIN_RUNNERS.get(platform)
@@ -3549,22 +4657,50 @@ async def api_account_whoami(platform: str):
     if backend == 'unsupported':
         return {'loggedIn': False, 'name': '', 'avatar': ''}
     if backend == 'wechat-oa':
-        # 不起浏览器：以 mp 后台会话/AppID 配置判断（见 _account_logged_in），名字取配置账号名
-        acc = _wechat_web_account()
-        return {'loggedIn': _account_logged_in(platform, cfg),
-                'name': acc.get('name', '') or '微信公众号', 'avatar': ''}
-    # 命中未过期缓存直接返回
+        if _mp_login_status()['state'] != 'success':
+            acc = _wechat_web_account()
+            return {'loggedIn': _account_logged_in(platform, cfg),
+                    'name': acc.get('name', '') or '微信公众号', 'avatar': ''}
+    process_key = 'wechat-oa-mp' if backend == 'wechat-oa' else platform
+    login_process = LOGIN_PROCESSES.get(process_key)
+    if login_process is not None and login_process.poll() is None:
+        if (_mp_login_status() if backend == 'wechat-oa' else _login_status(platform))['state'] == 'success':
+            try:
+                await asyncio.to_thread(login_process.wait, timeout=8)
+                if login_process.poll() is None:
+                    raise HTTPException(409, '登录已确认，浏览器仍在保存账号，请稍后重试校验')
+            except subprocess.TimeoutExpired:
+                raise HTTPException(409, '登录已确认，浏览器仍在保存账号，请稍后重试校验')
+        else:
+            with _WHOAMI_LOCK:
+                previous = _WHOAMI_CACHE.get(platform)
+            return previous[1] if previous else {
+                'loggedIn': _account_logged_in(platform, cfg), 'name': '', 'avatar': '',
+            }
+    marker_path = LOGIN_DIR / f'{process_key}.json'
+    def marker_version():
+        try:
+            return marker_path.read_bytes()
+        except OSError:
+            return None
+
+    initial_marker = marker_version()
     with _WHOAMI_LOCK:
         hit = _WHOAMI_CACHE.get(platform)
-    if hit and (time.time() - hit[0]) < WHOAMI_TTL:
+    cache_ttl = (min(WHOAMI_TTL, 60) if hit and hit[1].get('loggedIn')
+                 and (not hit[1].get('name') or not hit[1].get('avatar')) else WHOAMI_TTL)
+    if (not force and hit and (time.time() - hit[0]) < cache_ttl
+            and hit[1]['loggedIn'] == _account_logged_in(platform, cfg)):
         return hit[1]
     if backend == 'biliup':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'whoami',
                '--cookie', str(PROJECT_ROOT / 'cookies.json')]
     elif backend == 'xhs':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy']
+    elif backend == 'wechat-oa':
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'whoami', '--no-proxy']
     elif backend == 'douyin':
-        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami']
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'whoami', '--no-proxy']
     elif backend == 'toutiao':
         cmd = [sys.executable, str(TOUTIAO_SCRIPTS / 'toutiao_publish.py'), 'whoami']
     else:
@@ -3572,11 +4708,12 @@ async def api_account_whoami(platform: str):
                '--platform', cfg['wp']]
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                                       capture_output=True, text=True, timeout=150)
+                                       capture_output=True, text=True, encoding='utf-8',
+                                       timeout=35 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '校验超时（浏览器起不来或网络慢）')
     data = {'loggedIn': False, 'name': '', 'avatar': ''}
-    confident = False   # 是否拿到「可信」校验结论（子进程正常跑出 JSON 且无 error 字段）
+    confident = False
     for line in reversed((proc.stdout or '').strip().splitlines()):
         line = line.strip()
         if line.startswith('{'):
@@ -3584,24 +4721,30 @@ async def api_account_whoami(platform: str):
                 d = json.loads(line)
                 data = {'loggedIn': bool(d.get('loggedIn')), 'name': d.get('name') or '', 'avatar': d.get('avatar') or ''}
                 # 有 error 字段 = 校验本身失败（浏览器起不来/网络抖动/崩溃），不是可信的「未登录」结论
-                confident = not d.get('error')
+                confident = proc.returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
                 break
             except Exception:
                 continue
-    if not confident:
-        # 校验失败/无有效输出 → **不缓存、不删标记**，返回「上次已知」登录态（读标记）。
-        # 避免一次校验抖动就把已登录卡片翻成「未登录」并缓存 10 分钟；下次校验(缓存未写)会自动重试恢复。
+    current_process = LOGIN_PROCESSES.get(process_key)
+    if (marker_version() != initial_marker
+            or (current_process is not None and current_process.poll() is None)):
         return {'loggedIn': _account_logged_in(platform, cfg), 'name': '', 'avatar': ''}
+    if not confident:
+        raise HTTPException(502, '未能确认当前账号身份，请稍后重试校验；原登录状态和账号资料保持不变')
+    verified_logged_in = data['loggedIn']
+    if backend == 'wechat-oa' and not verified_logged_in and _wechat_has_credentials():
+        account = _wechat_web_account()
+        data = {'loggedIn': True, 'name': account.get('name', '') or '微信公众号', 'avatar': ''}
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE[platform] = (time.time(), data)
     # 回写标记：确认已登录 → 快速路径（/api/accounts、/api/analytics/platforms）此后也正确；
     # biliup 走 cookies.json 判定，不用标记文件。
     if backend != 'biliup':
-        if data['loggedIn']:
-            _write_login_marker(platform, 'success', data.get('name') or '')
+        if verified_logged_in:
+            _write_login_marker(process_key, 'success', data.get('name') or '')
         else:
             try:
-                (LOGIN_DIR / f'{platform}.json').unlink()
+                marker_path.unlink()
             except OSError:
                 pass
     return data
@@ -3643,6 +4786,15 @@ async def api_logout(platform: str):
         with _WHOAMI_LOCK:
             _WHOAMI_CACHE.pop(platform, None)
         return {'ok': True, 'deleted': deleted}
+    proc = LOGIN_PROCESSES.pop(platform, None)
+    if proc is not None and proc.poll() is None:
+        # 与上面公众号分支同理：停掉仍在跑的登录进程，否则它会把 success 标记
+        # 又写回 {platform}.json，账号在退出后“复活”成已登录。
+        try:
+            proc.terminate()
+            await asyncio.to_thread(proc.wait, timeout=5)
+        except Exception:
+            pass
     prof_name = cfg.get('profile')
     if prof_name:
         pdir = (BROWSER_PROFILES / prof_name).resolve()
@@ -3670,6 +4822,36 @@ async def api_logout(platform: str):
 # 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies 不起浏览器、
 # wechat-oa 走 mp 后台会话 Playwright 拦截数据 XHR）
 ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa", "toutiao"}
+_analytics_inflight: dict[str, asyncio.Task] = {}
+
+
+def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
+    process = subprocess.Popen(
+        cmd, cwd=str(PROJECT_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.stdout.close()
+            process.stderr.close()
+            process.wait(timeout=5)
+        raise
 
 
 @app.get("/api/analytics/platforms")
@@ -3684,9 +4866,25 @@ async def api_analytics_platforms():
 
 @app.get("/api/analytics/{platform}")
 async def api_analytics(platform: str):
-    """抓取某平台已登录账号的创作数据（粉丝/获赞/作品 + 与上次快照的增长）。起 headless 浏览器，数秒。"""
+    """抓取某平台已登录账号的创作数据，同平台并发刷新共享一次有时限的任务。"""
     if platform not in ANALYTICS_PLATFORMS:
         raise HTTPException(404, "该平台暂不支持数据抓取")
+    task = _analytics_inflight.get(platform)
+    if task is None or task.done():
+        task = asyncio.create_task(_fetch_analytics(platform))
+        _analytics_inflight[platform] = task
+        task.add_done_callback(lambda finished: _finish_analytics(platform, finished))
+    return await asyncio.shield(task)
+
+
+def _finish_analytics(platform: str, task: asyncio.Task) -> None:
+    if _analytics_inflight.get(platform) is task:
+        _analytics_inflight.pop(platform, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _fetch_analytics(platform: str):
     # B站用 cookie 调 API（无浏览器 profile）、公众号走 mp 后台会话（Playwright 拦截数据 XHR，见下），单独分支；其余走 account_stats（Playwright）
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
@@ -3702,18 +4900,28 @@ async def api_analytics(platform: str):
         # 代理策略由 account_stats.py 按平台自定（xhs 直连、其它走 env），后端照常传 _proxy_env
         cmd = [sys.executable, str(SHARED_SCRIPTS / "account_stats.py"), "fetch", "--platform", platform]
     ana_env = _proxy_env()
+    ana_env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=ana_env,
-                                       capture_output=True, text=True, timeout=180)
+        proc = await asyncio.to_thread(
+            _run_analytics_command, cmd, ana_env, 180 if platform == "wechat-oa" else 90)
     except subprocess.TimeoutExpired:
-        raise HTTPException(504, "抓取超时（浏览器起不来或网络慢）")
+        raise HTTPException(504, "抓取超时，已停止浏览器；请检查网络，关闭正在进行的登录或校验后重试")
     for line in reversed((proc.stdout or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
-                return json.loads(line)
+                result = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(result, dict):
+                continue
+            if proc.returncode or result.get("error"):
+                raise HTTPException(502, str(result.get("error") or "平台数据抓取失败")[:240])
+            if (result.get("loggedIn") is True
+                    and all(result.get(key) is None for key in ("followers", "likes", "following", "posts"))
+                    and not result.get("metrics") and not result.get("notes")):
+                raise HTTPException(502, "账号已登录，但平台未返回可用数据；请检查网络或平台维护状态后重试")
+            return result
     detail = (proc.stderr or "").strip().splitlines()[-1:] or ["未取到数据"]
     raise HTTPException(502, f"未取到数据（可能未登录或平台改版）：{detail[0][:120]}")
 
@@ -3727,8 +4935,40 @@ class PublishRequest(BaseModel):
     body: str = ''
     media: list[str] = []
     tags: str = ''
+    persona: str = ''
     # 存草稿：仅今日头条支持（落后台草稿箱，不公开发布）。其他平台忽略此字段。
     draft: bool = False
+
+
+class ManualPublishRequest(BaseModel):
+    title: str = Field(default='', max_length=1000)
+    body: str = Field(default='', max_length=100000)
+    tags: str = Field(default='', max_length=2000)
+    media: list[str] = Field(default_factory=list, max_length=32)
+    reviewed: StrictBool = False
+
+
+@app.get("/api/publishing-policy")
+def api_publishing_policy():
+    mode = publishing_mode(read_settings(ENV_FILE))
+    return {"mode": mode, "automaticSubmission": mode == "automated"}
+
+
+def _require_automated_publishing() -> None:
+    if publishing_mode(read_settings(ENV_FILE)) != "automated":
+        raise HTTPException(403, '当前为人工发布模式，请审核后复制或导出，在平台官方发布页亲自提交')
+
+
+@app.post("/api/manual-publish/{platform}/export")
+def api_manual_publish_export(platform: str, req: ManualPublishRequest):
+    """Build a local handoff package; never contact a platform or mark it published."""
+    try:
+        package = build_package(OUTPUTS_DIR, platform, req.title, req.body,
+                                req.tags, req.media, req.reviewed)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return {"path": package.relative_to(OUTPUTS_DIR.resolve()).as_posix(),
+            "filename": package.name, "published": False}
 
 
 def _write_publish_status(status_file: Path, state: str, message: str = '') -> None:
@@ -3754,8 +4994,27 @@ def _read_publish_status(platform: str) -> dict:
     return {'state': 'unknown', 'message': ''}
 
 
+def _record_successful_publish(title: str, body: str, cfg: dict, profile: str = '',
+                               tags: str = '', ptype: str = '',
+                               status: str = 'published') -> None:
+    try:
+        scripts_dir = str(SHARED_SCRIPTS)
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import calendar_ops
+        with _schedule_lock():
+            calendar_ops.record_publish(cfg['name'], title, note=body[:200],
+                                        tags=tags, ptype=ptype,
+                                        source='publish-page', profile=profile,
+                                        data_path=SCHEDULE_FILE, forward_log=True,
+                                        status=status)
+    except Exception:
+        pass
+
+
 def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                    status_file: Path, code_file: Path) -> None:
+                    status_file: Path, code_file: Path, profile: str = '',
+                    tags: str = '', ptype: str = '') -> None:
     """后台线程跑发布脚本（脚本自身把 starting/sms_required/verifying/success/error 写进 status_file）。
     结束后兜底补写终态 + 记 _publish.log + 成功则回流排期。"""
     ok = False
@@ -3784,19 +5043,12 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
     except OSError:
         pass
     if ok:
-        try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published', 'note': body[:200],
-                          'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
-        except Exception:
-            pass
+        _record_successful_publish(title, body, cfg, profile, tags, ptype)
 
 
 def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                         status_file: Path, code_file: Path) -> dict:
+                         status_file: Path, code_file: Path, profile: str = '',
+                         tags: str = '', ptype: str = '') -> dict:
     """启动异步发布：清旧码/状态 → 起后台线程 → 立即返回。前端轮询 /api/publish/{p}/status，
     遇 sms_required 弹输入框、提交到 /api/publish/{p}/sms。"""
     try:
@@ -3805,7 +5057,7 @@ def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: d
         pass
     _write_publish_status(status_file, 'starting', '发布中…（若触发风控会要求短信验证）')
     threading.Thread(target=_run_publish_bg,
-                     args=(platform, cmd, title, body, cfg, status_file, code_file),
+                     args=(platform, cmd, title, body, cfg, status_file, code_file, profile, tags, ptype),
                      daemon=True).start()
     # 关键：**不返回 ok:true**——这只是「已启动」的应答，真正结果要靠轮询 /status。
     # 若这里给 ok:true，旧前端会把它当「已发布」立刻显示成功（假成功 bug，真机踩过）。
@@ -3823,6 +5075,7 @@ async def api_publish_status(platform: str):
 @app.post("/api/publish/{platform}/sms")
 async def api_publish_sms(platform: str, req: SmsCodeRequest):
     """发布触发短信墙时回填验证码（写发布 runner 轮询的一次性验证码文件）。"""
+    _require_automated_publishing()
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
@@ -3836,12 +5089,16 @@ async def api_publish_sms(platform: str, req: SmsCodeRequest):
 @app.post("/api/publish/{platform}")
 async def api_publish(platform: str, req: PublishRequest):
     """一键发布：分发到对应 publisher 脚本真发（--exec）。二次确认在前端。"""
+    _require_automated_publishing()
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
     backend = cfg['backend']
     if backend == 'unsupported':
         raise HTTPException(400, f"{cfg['name']} 暂不支持一键发布")
+    profile = (req.persona or '').strip()
+    if profile and (not valid_persona_name(profile) or not profile_exists(profile)):
+        raise HTTPException(400, '选择的画像不存在或名称非法')
     if not req.title.strip() and not req.body.strip():
         raise HTTPException(400, '标题/正文不能为空')
     imgs, vids = [], []
@@ -3863,6 +5120,7 @@ async def api_publish(platform: str, req: PublishRequest):
     # 存草稿：仅今日头条支持（落后台草稿箱，不公开发布）。其他平台即便传了 draft
     # 也按「直接发布」处理——不能让草稿意图落到会真发的平台上。
     is_draft = platform == 'toutiao' and req.draft
+    publish_type = '视频' if vids else ('文章' if platform == 'wechat-oa' else '图文')
     py = sys.executable
     if platform == 'xiaohongshu':
         base = [py, str(SHARED_SCRIPTS / 'xhs_publish.py')]
@@ -3885,7 +5143,8 @@ async def api_publish(platform: str, req: PublishRequest):
         status_file = PUBLISH_DIR / 'douyin.json'
         code_file = PUBLISH_DIR / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
-        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file,
+                                    profile, tags, publish_type)
     elif platform == 'toutiao':
         # 头条图文：正文走 --content 直传（不落临时文件）。一键发布 → --exec；
         # 发布页选了「存草稿」时改用 --draft（只落后台草稿箱，不点发布按钮）。
@@ -3914,10 +5173,11 @@ async def api_publish(platform: str, req: PublishRequest):
         if extra_imgs:
             body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
         md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
-        conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
-                               str(md_path), '-o', str(html_path)],
-                              cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=60)
+        conv = await asyncio.to_thread(
+            subprocess.run, [py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
+                             str(md_path), '-o', str(html_path)],
+            cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=60)
         if conv.returncode != 0 or not html_path.is_file():
             raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
         wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
@@ -3950,16 +5210,8 @@ async def api_publish(platform: str, req: PublishRequest):
     except Exception:
         pass
     if ok:
-        try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'),
-                          'status': 'draft' if is_draft else 'published',
-                          'note': req.body[:200], 'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
-        except Exception:
-            pass
+        _record_successful_publish(title, req.body, cfg, profile, tags, publish_type,
+                                   status='draft' if is_draft else 'published')
     return {'ok': ok, 'message': ('已存草稿' if is_draft else '发布成功') if ok else '发布失败（见 detail）',
             'detail': detail}
 
@@ -4098,6 +5350,24 @@ def _write_baseline_profile(name: str, form: dict) -> None:
 @app.delete("/api/session/{session_key}")
 async def api_delete_session(session_key: str):
     """删除 OpenClaw 本地的 session 记录。"""
+    if session_key in _RUNNING_CHAT or _session_lock(session_key).locked():
+        raise HTTPException(409, "请先停止当前对话再删除")
+    record = harness_store.binding(SESSIONS_DIR, session_key)
+    if record and record.get("runtime") != "openclaw":
+        from easel.harnesses.rpc import close_sessions
+        await close_sessions(session_key)
+        harness_store.binding_path(SESSIONS_DIR, session_key).unlink(missing_ok=True)
+        _turn_file(f"web:{session_key}").unlink(missing_ok=True)
+        return {"deleted": True, "nativeHistoryDeleted": False}
+    direct_history = history_path(SESSIONS_DIR, session_key)
+    if direct_history.is_file():
+        if session_key in _RUNNING_CHAT:
+            raise HTTPException(409, "请先停止当前对话再删除")
+        direct_history.unlink()
+        _turn_file(f"web:{session_key}").unlink(missing_ok=True)
+        return {"deleted": True}
+    if _direct_api_enabled():
+        return {"deleted": False, "reason": "session not found"}
     sessions_file = _oc_state_dir() / 'agents' / 'main' / 'sessions' / 'sessions.json'
     if not sessions_file.is_file():
         return {'deleted': False, 'reason': 'sessions file not found'}
@@ -4112,12 +5382,13 @@ async def api_delete_session(session_key: str):
 
 
 TREND_SOURCES: dict[str, tuple[str, str | None]] = {
-    "weibo": ("https://60s.viki.moe/v2/weibo", "https://v2.xxapi.cn/api/weibohot"),
-    "douyin": ("https://60s.viki.moe/v2/douyin", "https://v2.xxapi.cn/api/douyinhot"),
-    "zhihu": ("https://60s.viki.moe/v2/zhihu", None),
-    "bilibili": ("https://60s.viki.moe/v2/bili", "https://v2.xxapi.cn/api/bilibilihot"),
-    "baidu": ("https://60s.viki.moe/v2/baidu/hot", "https://v2.xxapi.cn/api/baiduhot"),
-    "toutiao": ("https://60s.viki.moe/v2/toutiao", None),
+    "weibo": ("https://v2.xxapi.cn/api/weibohot", "https://60s.viki.moe/v2/weibo"),
+    "douyin": ("https://v2.xxapi.cn/api/douyinhot", "https://60s.viki.moe/v2/douyin"),
+    "zhihu": ("https://api.zhihu.com/topstory/hot-list?limit=50", "https://60s.viki.moe/v2/zhihu"),
+    "bilibili": ("https://v2.xxapi.cn/api/bilibilihot", "https://60s.viki.moe/v2/bili"),
+    "baidu": ("https://v2.xxapi.cn/api/baiduhot", "https://60s.viki.moe/v2/baidu/hot"),
+    "toutiao": ("https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc",
+                "https://60s.viki.moe/v2/toutiao"),
 }
 TREND_LABELS = {
     "weibo": "微博",
@@ -4128,31 +5399,58 @@ TREND_LABELS = {
     "toutiao": "头条",
 }
 _TREND_CACHE: dict[str, tuple[float, list]] = {}
+_HOT_TITLE_KEYS = ("title", "Title", "word", "name", "keyword")
+_HOT_HOT_KEYS = ("hot", "hot_value", "HotValue", "hotValue", "num", "detail_text")
+_HOT_URL_KEYS = ("url", "Url", "link", "mobil_url")
 
 
 def _http_get_json(url: str, timeout: int = 8):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Easel"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def _parse_hot(obj: dict) -> list[dict]:
-    data = obj.get("data")
+def _pick_str(data: object, keys: tuple[str, ...]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _trend_web_url(url: str) -> str:
+    match = re.fullmatch(r'https?://api\.zhihu\.com/questions/(\d+)', url)
+    return f'https://www.zhihu.com/question/{match.group(1)}' if match else url
+
+
+def _parse_hot(obj: object) -> list[dict]:
+    data = obj.get("data") if isinstance(obj, dict) else None
     if isinstance(data, dict):
         data = data.get("data") or data.get("list") or []
-    out = []
-    if isinstance(data, list):
-        for it in data:
-            if not isinstance(it, dict):
-                continue
-            title = it.get("title") or it.get("word") or it.get("name") or it.get("keyword")
-            if not title:
-                continue
-            out.append({
-                "title": str(title),
-                "hot": str(it.get("hot") or it.get("hot_value") or it.get("num") or ""),
-                "url": it.get("url") or it.get("link") or it.get("mobil_url") or "",
-            })
+    out: list[dict] = []
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if isinstance(item, str):
+            if item.strip():
+                out.append({"title": item.strip(), "hot": "", "url": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target") if isinstance(item.get("target"), dict) else {}
+        title = _pick_str(item, _HOT_TITLE_KEYS) or _pick_str(target, _HOT_TITLE_KEYS)
+        if not title:
+            continue
+        hot = _pick_str(item, _HOT_HOT_KEYS) or _pick_str(target.get("metrics_area"), ("text",))
+        url = _pick_str(item, _HOT_URL_KEYS) or _pick_str(target, _HOT_URL_KEYS)
+        out.append({"title": title, "hot": hot, "url": _trend_web_url(url)})
     return out
 
 
@@ -4190,6 +5488,7 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
             "platform": pf,
             "label": TREND_LABELS.get(pf, pf),
             "items": items[:max(1, min(limit, 30))],
+            "ok": bool(items),
         })
     return {"trends": result, "updated": int(now)}
 
@@ -4197,6 +5496,14 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
 SCHEDULE_KINDS = {"content", "event"}
+
+# _schedule.json 读-改-写串行化：发布回流（后台线程 _run_publish_bg + 事件循环上的
+# api_publish 成功路径）与增删改端点并发时，不加锁会互相覆盖丢记录。
+_SCHEDULE_LOCK = threading.Lock()
+
+
+def _schedule_lock() -> threading.Lock:
+    return _SCHEDULE_LOCK
 
 
 def _read_schedule() -> list[dict]:
@@ -4237,58 +5544,61 @@ async def api_schedule_list():
 
 @app.post("/api/schedule")
 async def api_schedule_create(req: ScheduleItem):
-    items = _read_schedule()
-    kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
-    st = req.status if req.status in SCHEDULE_STATUSES else "idea"
-    item = {
-        "id": uuid.uuid4().hex[:12],
-        "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
-        "date": req.date,
-        "platform": req.platform,
-        "time": req.time,
-        "status": st,
-        "note": req.note,
-        "kind": kind,
-        "url": req.url,
-        "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
-        "event_type": req.event_type,
-        "end_date": req.end_date,
-    }
-    items.append(item)
-    _write_schedule(items)
+    with _schedule_lock():
+        items = _read_schedule()
+        kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
+        st = req.status if req.status in SCHEDULE_STATUSES else "idea"
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
+            "date": req.date,
+            "platform": req.platform,
+            "time": req.time,
+            "status": st,
+            "note": req.note,
+            "kind": kind,
+            "url": req.url,
+            "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
+            "event_type": req.event_type,
+            "end_date": req.end_date,
+        }
+        items.append(item)
+        _write_schedule(items)
     return item
 
 
 @app.put("/api/schedule/{sid}")
 async def api_schedule_update(sid: str, req: ScheduleItem):
-    items = _read_schedule()
-    for it in items:
-        if it.get("id") == sid:
-            kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
-            it.update({
-                "title": req.title.strip() or it.get("title", "未命名"),
-                "date": req.date,
-                "platform": req.platform,
-                "time": req.time,
-                "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
-                "note": req.note,
-                "kind": kind,
-                "url": req.url,
-                "event_type": req.event_type,
-                "end_date": req.end_date,
-            })
-            _write_schedule(items)
-            return it
+    with _schedule_lock():
+        items = _read_schedule()
+        for it in items:
+            if it.get("id") == sid:
+                kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
+                it.update({
+                    "title": req.title.strip() or it.get("title", "未命名"),
+                    "date": req.date,
+                    "platform": req.platform,
+                    "time": req.time,
+                    "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
+                    "note": req.note,
+                    "kind": kind,
+                    "url": req.url,
+                    "event_type": req.event_type,
+                    "end_date": req.end_date,
+                })
+                _write_schedule(items)
+                return it
     raise HTTPException(404, "排期不存在")
 
 
 @app.delete("/api/schedule/{sid}")
 async def api_schedule_delete(sid: str):
-    items = _read_schedule()
-    new = [it for it in items if it.get("id") != sid]
-    if len(new) == len(items):
-        raise HTTPException(404, "排期不存在")
-    _write_schedule(new)
+    with _schedule_lock():
+        items = _read_schedule()
+        new = [it for it in items if it.get("id") != sid]
+        if len(new) == len(items):
+            raise HTTPException(404, "排期不存在")
+        _write_schedule(new)
     return {"ok": True, "deleted": sid}
 
 
@@ -4299,8 +5609,10 @@ async def api_schedule_context(days: int = 14):
     cmd = [sys.executable, str(SHARED_SCRIPTS / "calendar_ops.py"),
            "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
     try:
-        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=20)
+        # 冷启动要起一个 Python 子进程（最长 20s）：丢线程池，避免卡住事件循环
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=20)
         return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
     except Exception:
         return {}
@@ -4384,6 +5696,10 @@ async def api_ideas_delete(iid: str):
 
 if __name__ == "__main__":
     import uvicorn
+    from easel.runtime_env import web_environment
+
+    os.environ.update(web_environment(dict(os.environ)))
+    openclaw_base_cmd.cache_clear()
     port = int(os.environ.get("EASEL_PORT", "7860"))
     proxy_url = os.environ.get("VSCODE_PROXY_URI", "").replace("{{port}}", str(port))
     print("\n  ✦ Easel Web")

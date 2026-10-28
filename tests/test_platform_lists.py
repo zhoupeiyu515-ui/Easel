@@ -29,9 +29,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "web"))
 sys.path.insert(0, str(PROJECT_ROOT / "skills" / "shared" / "scripts"))
-sys.path.insert(0, str(PROJECT_ROOT / "skills" / "openclaw"
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "builtin"
                        / "asset-manager" / "scripts"))
-sys.path.insert(0, str(PROJECT_ROOT / "skills" / "openclaw"
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "builtin"
                        / "template-library" / "scripts"))
 
 import app as web  # noqa: E402
@@ -170,7 +170,7 @@ def test_calendar_platform_names_include_toutiao():
 
 def test_cross_platform_publish_skill_routes_toutiao():
     """跨平台发布的路由表——agent 读的是这张表，漏了就不会路由到头条。"""
-    md = (PROJECT_ROOT / "skills" / "openclaw"
+    md = (PROJECT_ROOT / "skills" / "builtin"
           / "skill-cross-platform-publish" / "SKILL.md").read_text(encoding="utf-8")
 
     assert "skill-toutiao-publisher" in md, "路由表缺头条 publisher"

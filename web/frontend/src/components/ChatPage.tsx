@@ -8,6 +8,7 @@ import type { UploadedFile } from '../lib/api';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 
 interface ChatPageProps {
+  apiDirect: boolean;
   session: ChatSession;
   stream?: StreamState;          // 进行中的流式态（来自 App，切页也不丢）
   onSend: (displayText: string, attachments?: UploadedFile[]) => void;
@@ -19,6 +20,7 @@ interface ChatPageProps {
     legacyAgentText?: string,
   ) => void; // 重试：仅对最后一轮
   onQuestionAnswered?: (questionId: string) => void;   // 某道问答题提交成功（App 记录答过，重放不再出现）
+  onQuestionClosed?: (id: string, status: string) => void;
 }
 
 // 空态推荐（贴合 Easel 社媒创作场景）
@@ -35,7 +37,7 @@ function greeting(): string {
   return `${g}，想创作点什么？`;
 }
 
-export default function ChatPage({ session, stream, onSend, onStop, onResend, onQuestionAnswered }: ChatPageProps) {
+export default function ChatPage({ apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered, onQuestionClosed }: ChatPageProps) {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -44,6 +46,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const isComposingRef = useRef(false);
 
   const isStreaming = !!stream;
   const isEmpty = session.messages.length === 0 && !isStreaming;
@@ -114,6 +117,9 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 输入法确认候选词/英文的回车交给输入法处理，不能触发发送。
+    // 部分浏览器先触发 compositionend，此时仍需用 229 识别输入法按键。
+    if (isComposingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -136,13 +142,17 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
         </div>
       )}
       <div className="composer-top">
-        <BrushEntry onPick={(t) => { setInput(t); requestAnimationFrame(() => textareaRef.current?.focus()); }} />
+        {apiDirect ? <span className="composer-hint">API 直连 · 文字与附件分析</span>
+          : <BrushEntry onPick={(t) => { setInput(t); requestAnimationFrame(() => textareaRef.current?.focus()); }} />}
         <textarea
           ref={textareaRef}
           className="chat-input"
           placeholder={dragOver ? '松手上传素材…' : hero ? '把你的想法告诉我，选题 / 文案 / 卡片 / 视频 / 发布都行…（可拖入图片/文档当素材）' : '发消息…（Enter 发送，Shift+Enter 换行，可拖入/粘贴素材）'}
           value={input}
           onChange={(e) => setInput(e.target.value)}
+          onCompositionStart={() => { isComposingRef.current = true; }}
+          onCompositionEnd={() => { isComposingRef.current = false; }}
+          onBlur={() => { isComposingRef.current = false; }}
           onKeyDown={handleKeyDown}
           onPaste={onPaste}
           rows={1}
@@ -176,10 +186,11 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
             <span>Easel</span>
           </div>
           <h1 className="chat-hero-title">{greeting()}</h1>
-          <p className="chat-hero-sub">从选题到发布，一站式帮你把想法做成能发的内容。</p>
+          <p className="chat-hero-sub">{apiDirect ? 'API 直连：写文案、策划选题、分析附件。本机工具和自动发布未启用。'
+            : '从选题到发布，一站式帮你把想法做成能发的内容。'}</p>
           {inputBox(true)}
           <div className="suggestions">
-            {SUGGESTIONS.map((s) => (
+            {SUGGESTIONS.filter((s) => !apiDirect || ['写小红书文案', '口播脚本'].includes(s.title)).map((s) => (
               <button key={s.title} className="card card-hover suggestion-card"
                 onClick={() => { if (!isStreaming) onSend(s.prompt); }}>
                 <span className="suggestion-icon">{s.icon}</span>
@@ -233,6 +244,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
               }
             }
             return (
+              <div key={`${i}-${msg.role}`}>
               <MessageBubble
                 key={`${i}-${msg.role}`}
                 message={msg}
@@ -242,10 +254,12 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
                 stillWorking={live ? stream!.stillWorking : ''}
                 actions={actions}
               />
+              {!live && msg.questions && <QuestionCards questions={msg.questions} onDone={onQuestionAnswered} onClosed={onQuestionClosed} />}
+              </div>
             );
           })}
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (
-            <QuestionCards questions={stream!.questions || []} onDone={(qid) => onQuestionAnswered?.(qid)} />
+            <QuestionCards questions={stream!.questions || []} onDone={(qid) => onQuestionAnswered?.(qid)} onClosed={onQuestionClosed} />
           )}
           <div ref={messagesEndRef} />
         </div>

@@ -26,8 +26,41 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export interface StatusResponse {
   gateway: boolean;
+  transport?: string;
+  runtime?: string;
   skills: SkillItem[];
   personas: PersonaItem[];
+}
+
+export interface HarnessSettingsResponse {
+  runtime: string;
+  models: Record<string, string>;
+  sandbox: string;
+  codex_auto_approve: boolean;
+  locked: boolean;
+  agents: { id: string; label: string; protocol: string; installed: boolean; install_hint: string }[];
+}
+
+export function fetchHarnessSettings(): Promise<HarnessSettingsResponse> {
+  return request('/api/settings/harness');
+}
+
+export interface HarnessModel {
+  id: string;
+  label: string;
+  default: boolean;
+}
+
+export function fetchHarnessModels(runtime: string): Promise<{ runtime: string; models: HarnessModel[] }> {
+  return request(`/api/settings/harness/models/${encodeURIComponent(runtime)}`, { method: 'POST' });
+}
+
+export function saveHarnessSettings(runtime: string, model: string, sandbox: string, codexAutoApprove?: boolean): Promise<HarnessSettingsResponse> {
+  return request('/api/settings/harness', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runtime, model, sandbox, codex_auto_approve: codexAutoApprove }),
+  });
 }
 
 export interface PersonaItem {
@@ -170,7 +203,7 @@ export function deletePersona(name: string): Promise<{ ok: boolean; deleted: str
 
 // ---- 热点雷达 ----
 export interface TrendItem { title: string; hot: string; url: string; }
-export interface TrendGroup { platform: string; label: string; items: TrendItem[]; }
+export interface TrendGroup { platform: string; label: string; items: TrendItem[]; ok?: boolean; }
 export function fetchTrends(platforms: string, limit = 12): Promise<{ trends: TrendGroup[]; updated: number }> {
   return request(`/api/trends?platforms=${encodeURIComponent(platforms)}&limit=${limit}`);
 }
@@ -281,6 +314,10 @@ export function fetchOutputs(): Promise<OutputNode[]> {
   return request<OutputNode[]>('/api/outputs');
 }
 
+export function fetchArtifactArchive(path: string, signal?: AbortSignal): Promise<{ paths: string[] }> {
+  return request<{ paths: string[] }>(`/api/artifacts/archive?path=${encodeURIComponent(path)}`, { signal });
+}
+
 export function fetchOutputContent(path: string): Promise<OutputContent> {
   return request<OutputContent>(`/api/output/${path.split('/').map(encodeURIComponent).join('/')}`);
 }
@@ -310,16 +347,18 @@ export interface ChatQuestion {
   id: string;              // gateway question record id (ask_...)
   questions: ChatQuestionItem[];
   expiresAtMs?: number;
+  status?: string;
 }
+export interface ChatQuestionClosed { id: string; status: string; }
 export async function answerQuestion(
   payload: { questionId: string; answers: Record<string, string[]>; resolvedBy?: string },
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; status?: string; expired?: boolean }> {
   const res = await fetch(`${BASE}/api/chat/question/answer`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const data = await res.json().catch(() => ({})) as { ok?: boolean; error?: string };
-  return { ok: data.ok === true, error: data.error };
+  const data = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; status?: string; expired?: boolean };
+  return { ok: data.ok === true, error: data.error, status: data.status, expired: data.expired };
 }
 
 /** 批量查 question 状态：过滤重放中已解决/已过期的旧题。 */
@@ -378,6 +417,7 @@ export interface LoginStart {
   state?: string;       // starting | qr_ready | success | expired | error | unknown
   message?: string;
   qr?: string;          // outputs 下相对路径，用 mediaUrl() 取图
+  qrTs?: number;
   configured?: boolean; // 凭证式：是否已配置
 }
 
@@ -413,7 +453,8 @@ export function startMpLogin(platform: string): Promise<LoginStatus> {
 
 /** 轮询公众号后台扫码登录状态。 */
 export function mpLoginStatus(platform: string): Promise<LoginStatus> {
-  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login/status`);
+  return request<LoginStatus>(`/api/accounts/${encodeURIComponent(platform)}/mp-login/status`,
+    { signal: AbortSignal.timeout(8000) });
 }
 
 export interface LoginStatus {
@@ -435,8 +476,8 @@ export interface AccountWhoami {
 }
 
 /** 真校验某平台登录态 + 拉昵称/头像（后端起 headless 浏览器，数秒）。 */
-export function accountWhoami(platform: string): Promise<AccountWhoami> {
-  return request<AccountWhoami>(`/api/accounts/${encodeURIComponent(platform)}/whoami`);
+export function accountWhoami(platform: string, force = false): Promise<AccountWhoami> {
+  return request<AccountWhoami>(`/api/accounts/${encodeURIComponent(platform)}/whoami${force ? '?force=true' : ''}`);
 }
 
 /** 退出登录：删该平台持久化登录态。 */
@@ -452,12 +493,30 @@ export interface PublishResult {
   pending?: boolean;
 }
 
+export interface PublishingPolicy {
+  mode: 'manual' | 'automated';
+  automaticSubmission: boolean;
+}
+
+export function fetchPublishingPolicy(): Promise<PublishingPolicy> {
+  return request('/api/publishing-policy');
+}
+
+/** Create a local export only; no social platform is contacted. */
+export function exportManualPackage(platform: string, payload: {
+  title: string; body: string; tags: string; media: string[]; reviewed: boolean;
+}): Promise<{ path: string; filename: string; published: false }> {
+  return request(`/api/manual-publish/${encodeURIComponent(platform)}/export`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
 /** 一键发布到某平台（真发布，--exec）。media 为 outputs 相对路径数组。
  * 抖音返回 {async:true}，需轮询 publishStatus；其他平台同步返回结果。
  * draft=true 表示存草稿（仅今日头条支持，落后台草稿箱不公开发布）。 */
 export function publishNow(
   platform: string,
-  payload: { title: string; body: string; media: string[]; tags?: string; draft?: boolean },
+  payload: { title: string; body: string; media: string[]; tags?: string; draft?: boolean; persona?: string },
 ): Promise<PublishResult> {
   return request<PublishResult>(`/api/publish/${encodeURIComponent(platform)}`, {
     method: 'POST',
@@ -487,11 +546,12 @@ export function submitPublishSms(platform: string, code: string): Promise<{ ok: 
 }
 
 export function startLogin(platform: string): Promise<LoginStart> {
-  return request<LoginStart>(`/api/login/${encodeURIComponent(platform)}`, { method: 'POST' });
+  return request<LoginStart>(`/api/login/${encodeURIComponent(platform)}?restart=true`, { method: 'POST' });
 }
 
 export function loginStatus(platform: string): Promise<LoginStatus> {
-  return request<LoginStatus>(`/api/login/${encodeURIComponent(platform)}/status`);
+  return request<LoginStatus>(`/api/login/${encodeURIComponent(platform)}/status`,
+    { signal: AbortSignal.timeout(8000) });
 }
 
 // ---- 归因层：账号创作数据 ----
@@ -510,11 +570,12 @@ export interface AccountAnalytics {
   likes: number | null;
   following: number | null;
   posts: number | null;
-  metrics: { label: string; value: string; vs: string }[];
+  metrics: { label: string; value: string | number; vs: string }[];
   notes: { title: string; url: string; cover?: string; stat?: string }[];
   growth: Record<'last' | 'day' | 'week' | 'month' | 'year',
     { followers: number | null; likes: number | null; posts: number | null; since_days: number | null } | null>;
   fetched_at: number;
+  warning?: string;
 }
 
 /** 支持抓数据的平台 + 各自登录态。 */
@@ -522,9 +583,10 @@ export function fetchAnalyticsPlatforms(): Promise<AnalyticsPlatform[]> {
   return request<AnalyticsPlatform[]>('/api/analytics/platforms');
 }
 
-/** 抓某平台已登录账号的创作数据（后端起 headless 浏览器，数秒）。 */
+/** 抓某平台已登录账号的创作数据，客户端等待时限略长于后端。 */
 export function fetchAccountAnalytics(platform: string): Promise<AccountAnalytics> {
-  return request<AccountAnalytics>(`/api/analytics/${encodeURIComponent(platform)}`);
+  return request<AccountAnalytics>(`/api/analytics/${encodeURIComponent(platform)}`,
+    { signal: AbortSignal.timeout(platform === 'wechat-oa' ? 195000 : 105000) });
 }
 
 /** 回填短信验证码（登录风控短信墙）：提交后 runner 读走填码继续登录。 */
@@ -561,6 +623,7 @@ export function streamChat(
   attachments: UploadedFile[] = [],
   onQuestion?: (q: ChatQuestion) => void,
   onHeartbeat?: (note: string) => void,
+  onQuestionClosed?: (q: ChatQuestionClosed) => void,
 ): AbortController {
   const controller = new AbortController();
   let lastEventId = 0;
@@ -596,7 +659,18 @@ export function streamChat(
         } else if (currentEvent === 'activity' && onActivity) {
           try { onActivity(JSON.parse(data) as string); } catch { onActivity(data); }
         } else if (currentEvent === 'question' && onQuestion) {
-          try { onQuestion(JSON.parse(data) as ChatQuestion); } catch { /* 解析失败忽略 */ }
+          // 防御：question 事件负载必须是对象且带 questions 数组。旧后端重放流曾把
+          // question 双层序列化（JSON.parse 后得到字符串），透传会渲染出无法作答的
+          // 空壳卡片——宁可不显示，交给用户手动追问。
+          try {
+            const q = JSON.parse(data) as ChatQuestion;
+            if (q && typeof q === 'object' && Array.isArray(q.questions)) onQuestion(q);
+          } catch { /* 解析失败忽略 */ }
+        } else if (currentEvent === 'question_closed' && onQuestionClosed) {
+          try {
+            const closed = JSON.parse(data) as ChatQuestionClosed;
+            if (closed && typeof closed.id === 'string' && typeof closed.status === 'string') onQuestionClosed(closed);
+          } catch {}
         } else if (currentEvent === 'heartbeat') {
           // 防呆心跳：独立于 activity/thinking，仅作「未卡住」提示，不覆盖真实状态。
           if (onHeartbeat) { try { onHeartbeat(JSON.parse(data) as string); } catch { onHeartbeat(data); } }
@@ -654,8 +728,12 @@ export function streamChat(
           : await fetch(`${BASE}/api/chat/jobs/${encodeURIComponent(turnId || '')}/stream?after=${lastEventId}`, {
               signal: controller.signal,
             });
-        if (!first && res.status === 404 && onRecoveryUnavailable) {
-          onRecoveryUnavailable();
+        // jobs 流 404 = 任务记录不存在（后端重启丢日志 / 首发请求 5xx 没起 supervisor）。
+        // 必须终结：旧逻辑依赖 onRecoveryUnavailable（新发送不传），不传时静默落进
+        // 无限重试（1s 一次 ×130 分钟），onError 永不触发，会话卡死在「自动续接」。
+        if (!first && res.status === 404) {
+          if (onRecoveryUnavailable) onRecoveryUnavailable();
+          else onError(new Error('任务记录不存在或已失效，无法续接；请重新发送'));
           return;
         }
         if (await consume(res)) return;
@@ -755,6 +833,9 @@ export interface ModelRow {
   keyMasked: string;
   role: string;
   result: string;
+  protocol?: string;
+  thinking?: boolean;
+  thinkingFormat?: string;
   keyNew?: string;
   keyNew2?: string;
   key2Label?: string;
@@ -774,6 +855,10 @@ export interface ModelSaveRow {
   key: string;
   key2?: string;
   primary?: boolean;
+  /** 自定义供应商上游协议：openai（默认）| anthropic */
+  protocol?: string;
+  thinking?: boolean;
+  thinkingFormat?: string;
 }
 
 export interface ModelSaveResponse extends ModelChannelsResponse {
@@ -792,6 +877,7 @@ export function saveModelConfig(channel: string, rows: ModelSaveRow[]): Promise<
 export interface ModelChannelRows { rows: ModelRow[] }
 
 export interface ModelChannelsResponse {
+  transport?: 'api' | 'openclaw';
   channels: {
     chat: ModelChannelRows;
     transcribe: ModelChannelRows;
@@ -803,8 +889,15 @@ export interface ModelChannelsResponse {
   primary: string;
 }
 
-export function fetchModelChannels(): Promise<ModelChannelsResponse> {
-  return request('/api/settings/models');
+export function fetchModelChannels(runtime?: string): Promise<ModelChannelsResponse> {
+  return request(`/api/settings/models${runtime ? `?runtime=${encodeURIComponent(runtime)}` : ''}`);
+}
+
+export function saveChatTransport(transport: 'api' | 'openclaw'): Promise<ModelChannelsResponse> {
+  return request('/api/settings/chat/transport', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transport }),
+  });
 }
 
 // （保存接口见上方 saveModelConfig）
@@ -865,10 +958,11 @@ export interface ModelsFetchResponse { baseUrl: string; models: string[]; fetche
  */
 export function fetchAvailableModels(
   baseUrl: string, key: string, protocol: string, slot = '',
+  name = '',
 ): Promise<ModelsFetchResponse> {
   return request('/api/settings/models/available', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ baseUrl, key, protocol, slot }),
+    body: JSON.stringify({ baseUrl, key, protocol, slot, name }),
   });
 }

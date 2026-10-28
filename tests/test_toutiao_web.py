@@ -115,7 +115,11 @@ def test_whoami_dispatch_passes_through_json(monkeypatch, client):
 
 
 def test_whoami_script_error_is_not_cached(monkeypatch, client):
-    """脚本自报 error（浏览器起不来）时，后端不能把它当「可信的未登录」写缓存。"""
+    """脚本自报 error（浏览器起不来）时，后端不能把它当「可信的未登录」写缓存。
+
+    上游 v0.3.0 起这类「结论不可信」的情况统一报 502（未能确认当前账号身份），
+    而不是回一个 loggedIn=False —— 后者会被前端当成「没登录，去扫码」误导用户。
+    """
     class FakeCompleted:
         returncode = 0
         stdout = json.dumps({"loggedIn": False, "name": "", "avatar": "",
@@ -126,40 +130,32 @@ def test_whoami_script_error_is_not_cached(monkeypatch, client):
 
     r = client.get("/api/accounts/toutiao/whoami")
 
-    assert r.status_code == 200
-    assert r.json()["loggedIn"] is False
+    assert r.status_code == 502, r.text
+    assert "未能确认" in r.json()["detail"], r.text
     with web._WHOAMI_LOCK:
         assert "toutiao" not in web._WHOAMI_CACHE, "error 结论不应进缓存"
 
 
 def test_publish_dispatch_uses_toutiao_script(monkeypatch, client):
     """发布分派：正文走 --content 直传，不落临时文件；标题/话题一并带上。"""
-    captured: dict = {}
-
-    class FakeCompleted:
-        returncode = 0
-        stdout = "ok"
-        stderr = ""
-
-    def fake_run(cmd, **kw):
-        captured["cmd"] = cmd
-        return FakeCompleted()
-
-    monkeypatch.setattr(web.subprocess, "run", fake_run)
+    cmds = _capture_all_cmds(monkeypatch)
 
     r = client.post("/api/publish/toutiao",
                     json={"title": "标题", "body": "正文内容", "tags": "AI"})
 
     assert r.status_code == 200, r.text
-    cmd = captured["cmd"]
-    assert Path(cmd[1]).as_posix().endswith(SCRIPT_SUFFIX), cmd
+    cmd = _publish_cmd(cmds)
     assert "--content" in cmd and "正文内容" in cmd, cmd
     assert "--title" in cmd and "标题" in cmd, cmd
 
 
-def _capture_publish_cmd(monkeypatch, client, payload: dict) -> list[str]:
-    """跑一次发布并返回真正拼出来的命令行（subprocess 被替身顶掉）。"""
-    captured: dict = {}
+def _capture_all_cmds(monkeypatch) -> list[list[str]]:
+    """收下发布链路里跑过的所有子进程命令行。
+
+    上游 v0.3.0 起发布成功后还会调 skill-publish-log 记一条，所以一次发布会起两个子进程；
+    只抓最后一个会抓到 log.py，必须按脚本路径挑出真正的发布命令。
+    """
+    cmds: list[list[str]] = []
 
     class FakeCompleted:
         returncode = 0
@@ -167,13 +163,27 @@ def _capture_publish_cmd(monkeypatch, client, payload: dict) -> list[str]:
         stderr = ""
 
     def fake_run(cmd, **kw):
-        captured["cmd"] = cmd
+        cmds.append(list(cmd))
         return FakeCompleted()
 
     monkeypatch.setattr(web.subprocess, "run", fake_run)
+    return cmds
+
+
+def _publish_cmd(cmds: list[list[str]]) -> list[str]:
+    """从所有子进程调用里挑出头条发布那一条。"""
+    for cmd in cmds:
+        if len(cmd) > 1 and Path(cmd[1]).as_posix().endswith(SCRIPT_SUFFIX):
+            return cmd
+    raise AssertionError(f"没找到头条发布命令，实际跑过：{cmds}")
+
+
+def _capture_publish_cmd(monkeypatch, client, payload: dict) -> list[str]:
+    """跑一次发布并返回真正拼出来的发布命令行（subprocess 被替身顶掉）。"""
+    cmds = _capture_all_cmds(monkeypatch)
     r = client.post("/api/publish/toutiao", json=payload)
     assert r.status_code == 200, r.text
-    return captured["cmd"]
+    return _publish_cmd(cmds)
 
 
 def test_publish_draft_flag_switches_to_draft(monkeypatch, client):
@@ -195,23 +205,13 @@ def test_publish_without_draft_flag_still_execs(monkeypatch, client):
 
 def test_draft_flag_ignored_for_other_platforms(monkeypatch, client):
     """draft=true 只对今日头条生效；其它平台不能被塞进草稿分支。"""
-    captured: dict = {}
+    cmds = _capture_all_cmds(monkeypatch)
 
-    class FakeCompleted:
-        returncode = 0
-        stdout = "ok"
-        stderr = ""
-
-    def fake_run(cmd, **kw):
-        captured["cmd"] = cmd
-        return FakeCompleted()
-
-    monkeypatch.setattr(web.subprocess, "run", fake_run)
     r = client.post("/api/publish/zhihu",
                     json={"title": "标题", "body": "正文", "media": [], "draft": True})
 
     assert r.status_code == 200, r.text
-    assert "--draft" not in captured["cmd"], captured["cmd"]
+    assert not any("--draft" in cmd for cmd in cmds), cmds
 
 
 def test_draft_publish_is_logged_as_draft_in_calendar(monkeypatch, client, tmp_path):

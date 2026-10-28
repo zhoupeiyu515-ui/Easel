@@ -12,12 +12,12 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SKILL_DIR = PROJECT_ROOT / "skills" / "openclaw" / "skill-toutiao-publisher"
+SKILL_DIR = PROJECT_ROOT / "skills" / "builtin" / "skill-toutiao-publisher"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 sys.path.insert(0, str(PROJECT_ROOT / "skills" / "shared" / "scripts"))
-sys.path.insert(0, str(PROJECT_ROOT / "skills" / "openclaw"
+sys.path.insert(0, str(PROJECT_ROOT / "skills" / "builtin"
                        / "skill-cross-platform-publish" / "scripts"))
 
 import toutiao_publish as tp  # noqa: E402

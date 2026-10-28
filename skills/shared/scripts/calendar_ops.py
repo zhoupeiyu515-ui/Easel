@@ -117,10 +117,10 @@ def _parse_date(s: str):
 # publish-log 转发（保持归因指标底座同步，best-effort）
 # --------------------------------------------------------------------------- #
 def _forward_publish_log(platform: str, title: str, url: str, ptype: str,
-                         tags: str, source: str) -> None:
-    # 兼容两种布局：项目根 skills/openclaw/... 与 OpenClaw workspace 拍平后的 skills/...
+                         tags: str, source: str, profile: str = "") -> None:
+    # 兼容两种布局：项目根 skills/builtin/... 与 OpenClaw workspace 拍平后的 skills/...
     candidates = [
-        PROJECT_ROOT / "skills" / "openclaw" / "skill-publish-log" / "scripts" / "log.py",
+        PROJECT_ROOT / "skills" / "builtin" / "skill-publish-log" / "scripts" / "log.py",
         PROJECT_ROOT / "skills" / "skill-publish-log" / "scripts" / "log.py",
     ]
     log_py = next((c for c in candidates if c.is_file()), None)
@@ -134,6 +134,8 @@ def _forward_publish_log(platform: str, title: str, url: str, ptype: str,
         cmd += ["--type", ptype]
     if tags:
         cmd += ["--tags", tags]
+    if profile:
+        cmd += ["--profile", profile]
     try:
         subprocess.run(cmd, capture_output=True, timeout=15,
                        env={**os.environ, "EASEL_CALENDAR_AUTORECORD": "0"})
@@ -146,13 +148,16 @@ def _forward_publish_log(platform: str, title: str, url: str, ptype: str,
 # --------------------------------------------------------------------------- #
 def record_publish(platform: str, title: str, url: str = "", ptype: str = "",
                    tags: str = "", note: str = "", source: str = "chat",
-                   data_path: Path | None = None, forward_log: bool = True) -> bool:
+                   profile: str = "", data_path: Path | None = None,
+                   forward_log: bool = True, status: str = "published") -> bool:
     """追加一条已发布记录到日历底座。返回是否写入。全程异常安全。
+    status='draft' 用于「存草稿」——内容进了平台草稿箱，不算已发布。
     env EASEL_CALENDAR_AUTORECORD=0 时直接跳过（发布页由 web 记录，防重复）。"""
     if os.environ.get("EASEL_CALENDAR_AUTORECORD") == "0":
         return False
     try:
         path = data_path or DEFAULT_DATA
+        profile = (profile or os.environ.get("EASEL_ACTIVE_PROFILE") or "").strip()
         now = _today()
         item = {
             "id": _new_id(),
@@ -160,11 +165,12 @@ def record_publish(platform: str, title: str, url: str = "", ptype: str = "",
             "date": now.strftime("%Y-%m-%d"),
             "platform": _norm_platform(platform),
             "time": now.strftime("%H:%M"),
-            "status": "published",
+            "status": status if status in CONTENT_STATUSES else "published",
             "note": (note or "")[:200],
             "kind": "content",
             "url": url or "",
             "source": source if source in SOURCES else "chat",
+            "profile": profile,
         }
         items = load(path)
         items.append(item)
@@ -173,7 +179,7 @@ def record_publish(platform: str, title: str, url: str = "", ptype: str = "",
         return False  # 记录失败绝不影响发布
     if forward_log:
         _forward_publish_log(_norm_platform(platform), item["title"], url, ptype,
-                             tags, "calendar-auto")
+                             tags, "calendar-auto", profile)
     return True
 
 
@@ -184,7 +190,8 @@ def cmd_record_publish(args) -> None:
     ok = record_publish(args.platform, args.title, url=args.url or "",
                         ptype=args.type or "", tags=args.tags or "",
                         note=args.note or "", source=args.source or "chat",
-                        data_path=Path(args.data), forward_log=not args.no_log)
+                        profile=args.profile or "", data_path=Path(args.data),
+                        forward_log=not args.no_log)
     print(json.dumps({"ok": ok, "skipped": not ok and
                       os.environ.get("EASEL_CALENDAR_AUTORECORD") == "0"},
                      ensure_ascii=False))
@@ -306,7 +313,7 @@ def _nth_weekday(year: int, month: int, weekday: int, nth: int):
 
 
 def _locate_lunar():
-    for c in (PROJECT_ROOT / "skills" / "openclaw" / "skill-event-calendar" / "scripts" / "lunar.py",
+    for c in (PROJECT_ROOT / "skills" / "builtin" / "skill-event-calendar" / "scripts" / "lunar.py",
               PROJECT_ROOT / "skills" / "skill-event-calendar" / "scripts" / "lunar.py"):
         if c.is_file():
             return c
@@ -545,6 +552,7 @@ def build_parser():
     r.add_argument("--tags", help="逗号分隔")
     r.add_argument("--note")
     r.add_argument("--source", default="chat", choices=sorted(SOURCES))
+    r.add_argument("--profile", help="创作者画像 / 品牌名（同步写入 publish-log）")
     r.add_argument("--no-log", action="store_true", help="不转发 publish-log")
     r.set_defaults(func=cmd_record_publish)
 

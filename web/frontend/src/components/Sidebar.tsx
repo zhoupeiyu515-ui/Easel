@@ -8,6 +8,7 @@ import {
   IconDashboard,
 } from './icons';
 import { IconGear } from './settingsIcons';
+import ThemeToggle from './ThemeToggle';
 
 export type Page = 'dashboard' | 'chat' | 'trends' | 'ideas' | 'calendar' | 'publish' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile';
 
@@ -20,13 +21,14 @@ interface SidebarProps {
   onNewProfile: () => void;
   sessions: ChatSession[];
   activeSessionId: string | null;
-  activeSessionHasMessages: boolean;
   onSessionSelect: (id: string) => void;
   onSessionDelete: (id: string) => void;
   onSessionRename: (id: string, title: string) => void;
   onSessionArchive: (id: string, archived: boolean) => void;
   onNewChat: () => void;
   gatewayStatus: string;
+  apiDirect: boolean;
+  agentRuntime: string;
   onOpenSettings: () => void;
 }
 
@@ -49,13 +51,14 @@ export default function Sidebar({
   onNewProfile,
   sessions,
   activeSessionId,
-  activeSessionHasMessages,
   onSessionSelect,
   onSessionDelete,
   onSessionRename,
   onSessionArchive,
   onNewChat,
   gatewayStatus,
+  apiDirect,
+  agentRuntime,
   onOpenSettings,
 }: SidebarProps) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -117,6 +120,7 @@ export default function Sidebar({
         <div className="sidebar-logo">
           <img className="sidebar-logo-icon" src="./static/easel-icon-transparent.png" alt="" />
           <h1>Easel</h1>
+          <ThemeToggle />
         </div>
         <select
           className="persona-select"
@@ -125,8 +129,7 @@ export default function Sidebar({
             if (e.target.value === '__new__') { onNewProfile(); return; }
             onPersonaChange(e.target.value);
           }}
-          disabled={activeSessionHasMessages}
-          title={activeSessionHasMessages ? '当前对话已绑定画像，切换画像将新建对话' : '选择用户画像'}
+          title="选择用户画像（一个对话对应一个画像：切换会新建一个对话）"
         >
           <option value="">通用模式</option>
           {personas.map((p) => (
@@ -171,15 +174,14 @@ export default function Sidebar({
 
       <div className="sidebar-status">
         <span className={`status-dot ${gatewayStatus === 'connected' ? '' : 'offline'}`} />
-        {gatewayStatus === 'connected'
-          ? '网关已连接'
+        <span className="sidebar-status-text">{gatewayStatus === 'connected'
+          ? (apiDirect ? '仅聊天模式已配置' : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 已安装` : '网关已连接')
           : gatewayStatus === 'disconnected'
-            ? '网关离线'
-            : '连接中…'}
+            ? (apiDirect ? 'API 配置不完整' : agentRuntime !== 'openclaw' ? `${agentRuntime} CLI 未配置` : '网关离线')
+            : '连接中…'}</span>
         <button className="settings-gear" onClick={onOpenSettings} title="设置（模型 · 环境 · 更多）">
           <IconGear size={13} /> 设置
         </button>
-        <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--text-tertiary)' }}>subnav-1</span>
       </div>
     </div>
   );

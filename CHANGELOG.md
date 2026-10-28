@@ -8,7 +8,7 @@ All notable changes to Easel are documented in this file.
 
 - Added Toutiao (今日头条) support: a new `skill-toutiao-publisher` publishing articles to the Toutiao creator backend (mp.toutiao.com) via Playwright with a persisted login profile, plus draft-only mode, cover upload, topic tags, and a 30-character title guard. Skill count is now 115.
 - Registered `toutiao` in the cross-platform dispatch registry (`publish_dispatch.py`) with its format constraints, and added the publisher script to the release-safety contract check in `scripts/validate_skills.py`.
-- Added inline image support to the Toutiao publisher (`--images`, comma-separated). Images are placed at the position of a standalone `![](path)` placeholder in the article body, or appended to the end when the body does not reference them. Because Toutiao's editor is ProseMirror-based, images go through the editor's own upload control (toolbar → 本地上传) so the platform hosts them on its own CDN — a local `src` would be stripped on submit. A failed insertion aborts the publish instead of silently shipping a text-only article.
+- Added inline image support to the Toutiao publisher (`--images`, comma-separated). Images are placed at the position of a standalone `![](path)` placeholder in the article body, or appended to the end when the body does not reference them. Because Toutiao's editor is ProseMirror-based, images go through the editor's own upload control (toolbar → upload → 确定) so the platform hosts them on its own CDN — a local `src` would be stripped on submit. A failed insertion aborts the publish instead of silently shipping a text-only article.
 - Added Toutiao to the account-data collection layer (`account_stats.py`) and to `ANALYTICS_PLATFORMS`, so the account page's 创作数据 panel now lists it and `GET /api/analytics/toutiao` works. Calibrated against a live account: followers come from the creator home page, per-day metrics (昨日展现量 / 昨日阅读(播放)量 / 昨日点赞量 / 昨日评论量) from 数据 → 作品数据.
 
 ### Improved
@@ -18,12 +18,44 @@ All notable changes to Easel are documented in this file.
 - Extended `skill-cross-platform-diff` to cover Toutiao (今日头条) across its supported-platform list, default scan set, comparison-matrix template, and platform-traits reference.
 - Added a Toutiao (今日头条) entry to `social-content` platform specs: title/body length, image and tag guidance, posting windows, and platform rules for the editorial drafting workflow.
 - Completed the Toutiao platform lists that were still missing from functional registries: the cross-platform publish routing table, the content-calendar platform-name map, the asset manager's platform recognition, and the template library's categories.
+- `calendar_ops.record_publish` now accepts a `status` argument, so a draft publish is recorded as `draft` instead of `published` in the content calendar.
 
 ### Fixed
 
 - Fixed the persona selector not listing existing profiles after a page load: the app now fetches the persona list on mount, so profiles created in earlier sessions show up in the sidebar dropdown and can be selected (`web/frontend/src/App.tsx`).
 - Fixed the publish page's "存草稿" option being dead code: `PublishRequest` had no `draft` field, so Pydantic dropped it and the Toutiao branch always took the `--exec` path. The workbench now has a real 存草稿 toggle (shown only for platforms that support it), the request carries the flag, and a draft publish is recorded as `draft` rather than `published` in the content calendar.
 - Fixed attachments being silently dropped for Toutiao: images selected in the publish page were parsed by the backend but never forwarded, so no article could carry a picture. They are now passed through as `--images`.
+
+## [0.3.0] - 2026-10-12
+
+### Added
+
+- Added selectable execution engines in Web settings: OpenClaw, Codex, OpenCode, a locally configured ACP agent, and chat-only mode. Engine selection is independent of model providers; Codex and OpenCode expose native model catalogs without copying their credentials.
+- Added optional OpenClaw installation: interactive setup defaults to OpenClaw but allows skipping it; use `bash setup.sh --skip-openclaw` or `.\setup.ps1 -SkipOpenClaw` to install the Web workspace first and select an already installed harness later.
+- Added a responsive creative-artifact gallery with previous/next controls, keyboard navigation, and support for multiple outputs.
+- Added documentation and Agent-prompt path validation, plus harness-settings regression coverage across Linux, macOS, Windows, and Python 3.10/3.12.
+
+### Improved
+
+- Moved shared Agent prompts and workspace resources to `agents/`, and built-in skills to `skills/builtin/`, replacing the OpenClaw-specific directory names. Updated documentation, prompt paths, installer references, and skill synchronization accordingly.
+- Improved harness CLI discovery across user-specific npm, Node, and native installations, including Windows launchers and incomplete environments.
+- Preserved conversation ownership, native-session continuation, and existing browser history when switching personas or execution engines.
+- Improved settings loading, unified input and dropdown styling, retained configuration panels for unavailable harnesses, and prevented the sidebar Settings button from wrapping.
+- Added custom-model reasoning capability configuration and improved provider credential synchronization.
+
+### Fixed
+
+- Improved QR capture, retry freshness, navigation-timeout handling, and terminal login-state polling for Xiaohongshu, Zhihu, and WeChat Channels.
+- Improved account verification and nickname/avatar extraction; stale verification responses no longer overwrite newly logged-in accounts.
+- Fixed UTF-8 handling and Windows installation PATH preservation, and improved installer idempotency and configuration validation.
+- Fixed runtime version drift: package metadata and harness protocol handshakes now report the same Easel version.
+- Fixed Python 3.10 compatibility when stopping Agent execution, including repeated-stop protection during process cleanup.
+
+### Upgrade Notes
+
+- Update to this version and rerun the appropriate setup script. For an existing OpenClaw workspace, `bash agents/sync.sh --docs-only` refreshes prompts without replacing private memory or user-provided skills.
+- Codex and OpenCode must be installed and authenticated separately before selection. Chat-only mode does not run tools or skills; generic ACP requires a local command configuration.
+- Platform maintenance, network restrictions, and anti-abuse checks can still prevent QR login; this release improves detection and error reporting rather than bypassing those restrictions.
 
 ## [0.2.1] - 2026-09-24
 
