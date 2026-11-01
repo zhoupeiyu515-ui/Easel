@@ -135,7 +135,7 @@
 - **交付前必须过 `text-polisher`**（`skills/builtin/text-polisher/`）：AI 水文是头条的重点治理项，
   而"AI 味"和"公文腔/吊胃口"在头条读者侧的体感几乎一致——读着像 AI 写的稿子，
   完读和互动会直接吃亏。走它的「平台特化：今日头条」一节逐条过
-  （见 `references/zh-ai-markers.md`），并满足中文去 AI 感评分 ≥45/50。
+  （见 `../../text-polisher/references/zh-ai-markers.md`），并满足中文去 AI 感评分 ≥45/50。
 
 ---
 

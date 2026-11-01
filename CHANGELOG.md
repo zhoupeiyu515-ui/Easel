@@ -6,7 +6,7 @@ All notable changes to Easel are documented in this file.
 
 ### Added
 
-- Added Toutiao (今日头条) support: a new `skill-toutiao-publisher` publishing articles to the Toutiao creator backend (mp.toutiao.com) via Playwright with a persisted login profile, plus draft-only mode, cover upload, topic tags, and a 30-character title guard. Skill count is now 115.
+- Added Toutiao (今日头条) support: a new `skill-toutiao-publisher` publishing articles to the Toutiao creator backend (mp.toutiao.com) via Playwright with a persisted login profile, plus draft-only mode, cover upload, topic tags, and a 30-character title guard. Skill count is now 116.
 - Registered `toutiao` in the cross-platform dispatch registry (`publish_dispatch.py`) with its format constraints, and added the publisher script to the release-safety contract check in `scripts/validate_skills.py`.
 - Added inline image support to the Toutiao publisher (`--images`, comma-separated). Images are placed at the position of a standalone `![](path)` placeholder in the article body, or appended to the end when the body does not reference them. Because Toutiao's editor is ProseMirror-based, images go through the editor's own upload control (toolbar → upload → 确定) so the platform hosts them on its own CDN — a local `src` would be stripped on submit. A failed insertion aborts the publish instead of silently shipping a text-only article.
 - Added Toutiao to the account-data collection layer (`account_stats.py`) and to `ANALYTICS_PLATFORMS`, so the account page's 创作数据 panel now lists it and `GET /api/analytics/toutiao` works. Calibrated against a live account: followers come from the creator home page, per-day metrics (昨日展现量 / 昨日阅读(播放)量 / 昨日点赞量 / 昨日评论量) from 数据 → 作品数据.

@@ -79,7 +79,7 @@ mp.toutiao.com/profile_v4/graphic/publish   图文发布页
    ```bash
    python skills/builtin/skill-toutiao-publisher/scripts/toutiao_publish.py --selftest
    ```
-   再在仓库根跑一遍契约校验：`scripts/validate_skill_commands.py`（在仓库根执行，不在本 skill 目录下）。
+   再在仓库根跑一遍契约校验：`python scripts/validate_skill_commands.py`（在仓库根执行，不在本 skill 目录下）。
 
 ## 五、登录态
 
