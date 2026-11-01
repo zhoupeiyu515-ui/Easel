@@ -33,7 +33,7 @@ def isolated(tmp_path, monkeypatch):
 def test_defaults_fit_all_builtin_descriptions(isolated):
     count, chars = doctor._builtin_skills_estimate({})
     updates = doctor._skills_budget_updates({}, {})
-    assert count == 116   # fork 比上游多一个 skill-toutiao-publisher
+    assert count == 116   # 新增 skill-toutiao-publisher 后
     assert updates["maxSkillsInPrompt"] >= count
     assert updates["maxSkillsPromptChars"] >= chars + 8192
     assert updates["maxSkillsInPrompt"] == 200
@@ -87,7 +87,7 @@ def test_invalid_config_is_not_replaced_by_defaults(isolated, config):
 def test_long_unicode_workspace_expands_default_budget(isolated, monkeypatch):
     monkeypatch.setenv("EASEL_OPENCLAW_WORKSPACE", "/" + "路径😀&" * 150)
     count, chars = doctor._builtin_skills_estimate({})
-    assert count == 116 and chars > 80000   # fork 比上游多一个 skill-toutiao-publisher
+    assert count == 116 and chars > 80000   # 新增 skill-toutiao-publisher 后
     assert doctor._skills_budget_updates({}, {})["maxSkillsPromptChars"] >= chars + 8192
 
 
