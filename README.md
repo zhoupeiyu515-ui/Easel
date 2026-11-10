@@ -65,7 +65,7 @@ Easel 围绕五个连续工作流展开：**发现**适合账号的热点与机�
 - **技能是真执行，不是功能清单**：图片、卡片、配音、字幕、剪辑、短剧和发布技能都配有可运行脚本，成品写入 `outputs/`。
 - **一份素材，多种平台形态**：同一主题可以改写成小红书卡片、短视频、知乎长文或短帖，并遵循不同平台的格式和字数要求。
 - **项目化保存产物**：内容、素材、中间文件和元数据按项目归档，后续修改、重试和发布不会散落在聊天记录里。
-- **真实发布与复盘闭环**：目前支持小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号七个平台的登录、适配和发布，并可回收账号数据。
+- **真实发布与复盘闭环**：目前支持小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号、推特 X、掘金、今日头条十个平台的登录、适配和发布，并可回收账号数据。
 
 ## 🧭 五层内容工作流
 
@@ -83,7 +83,7 @@ Easel 围绕五个连续工作流展开：**发现**适合账号的热点与机�
 | **策划** | 账号定位分析、受众画像、人设与声音构建、账号诊断、选题矩阵、选题评分、热点结合、系列内容规划、标题与 Hook、文章大纲、分镜脚本、内容日历、跨平台复用、直播策划、营销活动与商单方案 |
 | **文字与视觉** | 社媒文案、短视频与中长视频脚本、小红书笔记、长文、小说、去 AI 感改写、风格迁移、论文解读、金句卡、小红书知识卡、海报、信息图、数据图表、思维导图、对比图、电商详情图、Meme、AI 生图、图片增强、去背景与批处理 |
 | **音频与视频** | 文字转语音、多角色配音、声音克隆、AI 音乐、降噪、混音、语音转文字、音频可视化、AI 视频、AI 短剧、字幕与翻译、视频剪辑、长视频切片、直播高光、横竖版转换、片头片尾、相册视频、音乐卡点、绿幕换背景、视频转图文与章节目录 |
-| **发布与归因** | 发布质量门禁、敏感与版权风险检查、平台搜索优化、发布 Checklist、多平台格式适配；小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号登录与发布；内容日历回写、账号数据、评论洞察、内容复盘、ROI 与画像记忆 |
+| **发布与归因** | 发布质量门禁、敏感与版权风险检查、平台搜索优化、发布 Checklist、多平台格式适配；小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号、推特 X、掘金、今日头条登录与发布；内容日历回写、账号数据、评论洞察（掘金走公开 JSON 接口、X 走网页 DOM 采集）、内容复盘、ROI 与画像记忆 |
 
 ## 🖥️ 工作台功能示例
 
@@ -99,7 +99,7 @@ Easel 围绕五个连续工作流展开：**发现**适合账号的热点与机�
     </td>
     <td width="50%" valign="top">
       <strong>🔥 热点雷达</strong><br>
-      <sub>聚合微博、抖音、知乎、B 站、百度和头条等平台热榜，帮助 Agent 从实时趋势中筛选适合当前账号的选题。</sub><br><br>
+      <sub>聚合现有平台热榜，并通过标准协议接入你自己的 Python 采集脚本、HTTP 服务或 RSS/Atom 订阅，从更多来源寻找适合账号的选题。</sub><br><br>
       <img src="assets/readme/features/discover.png" width="100%" alt="Easel 多平台热点雷达">
     </td>
   </tr>
@@ -201,7 +201,7 @@ README 的品牌图、海报、案例图片和视频统一保存在 `assets/read
 
 ## 🚀 快速开始
 
-环境要求：Linux、macOS 或 Windows 10/11、Python 3.10 及以上、Python `venv` 模块和 `git`。安装向导会检查 Node.js 24.16+（24.x）、26.1+（26.x）或 27+（25.x 与 26.0 不兼容）、FFmpeg、Playwright/Chromium；缺少 Node.js 时会按系统给出安装引导。
+环境要求：Linux、macOS 或 Windows 10/11、Python 3.10 及以上、Python `venv` 模块和 `git`。安装向导会检查 Node.js 24.22.1+（24.x）、26.12.1+（26.x）或 27+（25.x 不兼容）、FFmpeg、Playwright/Chromium；缺少 Node.js 时会按系统给出安装引导。
 
 ```bash
 git clone https://github.com/ZJU-REAL/Easel.git
@@ -218,7 +218,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
 ```
 
-Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.16+（24.x）、26.1+（26.x）或 27+、Git 和 FFmpeg；25.x 与 26.0 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
+Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.22.1+（24.x）、26.12.1+（26.x）或 27+、Git 和 FFmpeg；25.x 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
 
 安装器支持 Windows 自带的 PowerShell 5.1，安装后可直接运行 `.venv\Scripts\easel.exe web` 启动工作台。原生安装与 Web/CLI 入口已经提供；各技能及浏览器发布的 Windows 全链路兼容仍在持续完善。
 
@@ -383,6 +383,8 @@ Easel 使用独立的 `easel` OpenClaw profile，不会覆盖你本机已有的 
 
 ## 📑 文档
 
+- [热点数据源接入：Python 脚本 / HTTP 服务 / RSS 订阅](docs/trend-collectors.md)
+- [渠道平台接入指南](docs/channel-platforms.md)
 - [能力地图](docs/skill-function-mapping.md)
 - [SKILL 接口规范](docs/SKILL-SPEC.md)
 - [提示词与架构分层](docs/prompt-stack.md)

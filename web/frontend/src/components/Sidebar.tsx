@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import type { ChatSession } from '../lib/store';
-import type { PersonaItem } from '../lib/api';
 import type { ComponentType } from 'react';
 import {
   IconChat, IconSkills, IconOutputs, IconAccounts, IconProfile,
@@ -15,10 +14,6 @@ export type Page = 'dashboard' | 'chat' | 'trends' | 'ideas' | 'calendar' | 'pub
 interface SidebarProps {
   currentPage: Page;
   onPageChange: (page: Page) => void;
-  personas: PersonaItem[];
-  selectedPersona: string;
-  onPersonaChange: (persona: string) => void;
-  onNewProfile: () => void;
   sessions: ChatSession[];
   activeSessionId: string | null;
   onSessionSelect: (id: string) => void;
@@ -45,10 +40,6 @@ const NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }
 export default function Sidebar({
   currentPage,
   onPageChange,
-  personas,
-  selectedPersona,
-  onPersonaChange,
-  onNewProfile,
   sessions,
   activeSessionId,
   onSessionSelect,
@@ -122,21 +113,6 @@ export default function Sidebar({
           <h1>Easel</h1>
           <ThemeToggle />
         </div>
-        <select
-          className="persona-select"
-          value={selectedPersona}
-          onChange={(e) => {
-            if (e.target.value === '__new__') { onNewProfile(); return; }
-            onPersonaChange(e.target.value);
-          }}
-          title="选择用户画像（一个对话对应一个画像：切换会新建一个对话）"
-        >
-          <option value="">通用模式</option>
-          {personas.map((p) => (
-            <option key={p.name} value={p.name}>{p.name}</option>
-          ))}
-          <option value="__new__">+ 新建画像…</option>
-        </select>
       </div>
 
       <nav className="sidebar-nav">
